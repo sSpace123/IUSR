@@ -1,0 +1,7 @@
+.venv/
+.venv-anaconda/
+.uv-cache/
+__pycache__/
+*.py[cod]
+ui_preview.png
+
