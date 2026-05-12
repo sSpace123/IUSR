@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import json
+import os
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -22,6 +24,46 @@ class AIConfig:
     api_key: str = ""
     base_url: str = "https://api.openai.com/v1"
     model: str = "gpt-4o-mini"
+
+
+def load_local_ai_config(enabled: bool = False) -> AIConfig:
+    """Load optional API settings from environment variables or a local .env file."""
+    env = _read_dotenv(Path.cwd() / ".env")
+    api_key = (
+        os.environ.get("DEEPSEEK_API_KEY")
+        or env.get("DEEPSEEK_API_KEY")
+        or os.environ.get("OPENAI_API_KEY")
+        or env.get("OPENAI_API_KEY")
+        or ""
+    )
+    base_url = (
+        os.environ.get("DEEPSEEK_BASE_URL")
+        or env.get("DEEPSEEK_BASE_URL")
+        or os.environ.get("OPENAI_BASE_URL")
+        or env.get("OPENAI_BASE_URL")
+        or "https://api.deepseek.com/v1"
+    )
+    model = (
+        os.environ.get("DEEPSEEK_MODEL")
+        or env.get("DEEPSEEK_MODEL")
+        or os.environ.get("OPENAI_MODEL")
+        or env.get("OPENAI_MODEL")
+        or "deepseek-chat"
+    )
+    return AIConfig(enabled=enabled, api_key=api_key, base_url=base_url, model=model)
+
+
+def _read_dotenv(path: Path) -> dict[str, str]:
+    if not path.exists():
+        return {}
+    values: dict[str, str] = {}
+    for raw_line in path.read_text(encoding="utf-8", errors="ignore").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        values[key.strip().lstrip("\ufeff")] = value.strip().strip('"').strip("'")
+    return values
 
 
 def suggest_import_options(preview: FilePreview, config: AIConfig) -> dict[str, Any]:
@@ -109,4 +151,3 @@ def _chat_json(config: AIConfig, system_prompt: str, payload: dict[str, Any]) ->
 
     content = data["choices"][0]["message"]["content"]
     return json.loads(content)
-

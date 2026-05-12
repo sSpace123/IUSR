@@ -30,12 +30,13 @@ from app.import_dialog import ImportDialog
 from app.ui_helpers import make_step_label
 from app.widgets.signal_plot_widget import AnalysisDisplayWidget
 from core.ai_assistant import suggest_analysis_parameters
-from core.data_loader import load_signal_file
+from core.data_loader import DataImportOptions, load_signal_file
 from core.export import export_signal_csv
 from core.feature_extraction import compute_basic_features
 from core.filtering import narrowband_filter
 from core.signal_data import MultiChannelSignal
 from core.spectrum_analysis import compute_fft
+from core.toneburst import generate_toneburst_preview
 from core.wavelet_analysis import compute_cwt
 
 
@@ -46,6 +47,7 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.setWindowTitle("超声信号分析软件")
         self.resize(1420, 860)
+        self.setMinimumSize(960, 640)
         self.setAcceptDrops(True)
 
         self.signal: MultiChannelSignal | None = None
@@ -57,9 +59,6 @@ class MainWindow(QMainWindow):
         self.channel_panel = ChannelPanel()
         self.control_panel = ControlPanel()
         self.feature_table = QTableWidget(0, 12)
-        self.feature_table.setHorizontalHeaderLabels(
-            ["通道", "峰值", "峰峰值", "RMS", "能量", "主频(Hz)", "峰值时间(s)", "到达时间(s)"]
-        )
         self.feature_table.setHorizontalHeaderLabels(
             [
                 "Channel",
@@ -88,7 +87,8 @@ class MainWindow(QMainWindow):
         self._connect_signals()
         self._apply_style()
         self._set_step(0)
-        self.statusBar().showMessage("就绪：请导入 CSV/TXT 信号文件")
+        self.display.show_empty()
+        self.statusBar().showMessage("就绪：请导入 CSV/TXT 或拖拽多个文件到窗口")
 
     def dragEnterEvent(self, event: QDragEnterEvent) -> None:
         """Accept dropped local files."""
@@ -96,10 +96,10 @@ class MainWindow(QMainWindow):
             event.acceptProposedAction()
 
     def dropEvent(self, event: QDropEvent) -> None:
-        """Load the first dropped file."""
-        urls = event.mimeData().urls()
-        if urls:
-            self._load_path(Path(urls[0].toLocalFile()))
+        """Load one or more dropped files as channels."""
+        paths = [Path(url.toLocalFile()) for url in event.mimeData().urls() if url.isLocalFile()]
+        if paths:
+            self._load_paths(paths)
 
     def _build_layout(self) -> None:
         shell = QWidget()
@@ -123,19 +123,21 @@ class MainWindow(QMainWindow):
         shell_layout.addWidget(top)
 
         splitter = QSplitter(Qt.Orientation.Horizontal)
+        splitter.setChildrenCollapsible(False)
         splitter.addWidget(self.channel_panel)
         splitter.addWidget(self.display)
         splitter.addWidget(self.control_panel)
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
         splitter.setStretchFactor(2, 0)
-        splitter.setSizes([250, 900, 290])
+        splitter.setSizes([250, 900, 310])
         shell_layout.addWidget(splitter, 1)
 
         self.setCentralWidget(shell)
 
     def _connect_signals(self) -> None:
         self.channel_panel.import_requested.connect(self._choose_file)
+        self.channel_panel.clear_requested.connect(self._clear_current)
         self.channel_panel.visibility_changed.connect(self._refresh_time_plot)
         self.control_panel.display_changed.connect(self._refresh_time_plot)
         self.control_panel.fft_requested.connect(self._run_fft)
@@ -148,51 +150,96 @@ class MainWindow(QMainWindow):
         self.control_panel.ai_adjust_requested.connect(self._run_ai_adjustment)
 
     def _choose_file(self) -> None:
-        path, _ = QFileDialog.getOpenFileName(
+        paths, _ = QFileDialog.getOpenFileNames(
             self,
-            "导入信号数据",
+            "导入信号文件",
             "",
             "Signal Files (*.csv *.txt *.xlsx *.xls *.npy *.npz *.mat);;All Files (*)",
         )
-        if path:
-            self._load_path(Path(path))
+        if paths:
+            self._load_paths([Path(path) for path in paths])
 
-    def _load_path(self, path: Path) -> None:
+    def _load_paths(self, paths: list[Path]) -> None:
         try:
-            if path.suffix.lower() in {".csv", ".txt"}:
-                dialog = ImportDialog(
-                    path,
-                    self.control_panel.sample_rate_input.value(),
-                    self,
-                    ai_config=self.control_panel.ai_config(),
-                )
-                if dialog.exec() != QDialog.DialogCode.Accepted:
-                    return
-                self.signal = load_signal_file(path, options=dialog.selected_options())
-            else:
-                self.signal = load_signal_file(
-                    path, sample_rate=self.control_panel.sample_rate_input.value()
-                )
+            signal = self._load_single_path(paths[0]) if len(paths) == 1 else self._load_multi_paths(paths)
         except Exception as exc:
+            if isinstance(exc, _UserCancelled):
+                return
             self._show_error("导入失败", _friendly_error(exc))
             return
+        self._accept_loaded_signal(signal, paths[0], len(paths))
 
-        self.current_path = path
+    def _load_single_path(self, path: Path) -> MultiChannelSignal:
+        if path.suffix.lower() in {".csv", ".txt"}:
+            options = self._ask_import_options(path)
+            if options is None:
+                raise _UserCancelled()
+            return load_signal_file(path, options=options)
+        return load_signal_file(path, sample_rate=self.control_panel.sample_rate_input.value())
+
+    def _load_multi_paths(self, paths: list[Path]) -> MultiChannelSignal:
+        options: DataImportOptions | None = None
+        if paths[0].suffix.lower() in {".csv", ".txt"}:
+            options = self._ask_import_options(paths[0])
+            if options is None:
+                raise _UserCancelled()
+
+        signals: list[MultiChannelSignal] = []
+        for path in paths:
+            if path.suffix.lower() in {".csv", ".txt"}:
+                import_options = options or DataImportOptions(
+                    sample_rate=self.control_panel.sample_rate_input.value()
+                )
+                signal = load_signal_file(path, options=import_options)
+            else:
+                signal = load_signal_file(path, sample_rate=self.control_panel.sample_rate_input.value())
+            signals.append(signal)
+        return _combine_signals_as_channels(paths, signals)
+
+    def _ask_import_options(self, path: Path) -> DataImportOptions | None:
+        dialog = ImportDialog(
+            path,
+            self.control_panel.sample_rate_input.value(),
+            self,
+            ai_config=self.control_panel.ai_config(),
+        )
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return None
+        return dialog.selected_options()
+
+    def _accept_loaded_signal(self, signal: MultiChannelSignal, first_path: Path, file_count: int) -> None:
+        self.signal = signal
+        self.current_path = first_path
         self.processed_signal = None
         self.feature_rows = []
         self.last_auto_adjustment = ""
         self.control_panel.sample_rate_input.setValue(self.signal.sample_rate)
         self._auto_tune_filter_defaults()
         self._auto_tune_wavelet_defaults()
-        self.channel_panel.update_signal(path, self.signal)
+        self.channel_panel.update_signal(
+            first_path if file_count == 1 else f"{file_count} files",
+            self.signal,
+        )
         self.feature_table.setRowCount(0)
         self._refresh_time_plot()
         self._set_step(1)
-        self.control_panel.set_ready("数据已导入，可开始分析")
+        self.control_panel.set_ready("导入完成：已显示时域信号")
         self.statusBar().showMessage(
-            f"已导入：{path.name} | 采样率 {self.signal.sample_rate:.6g} Hz | "
-            f"通道 {len(self.signal.channels)}"
+            f"导入完成 | 采样率 {self.signal.sample_rate:.6g} Hz | 通道 {len(self.signal.channels)}"
         )
+
+    def _clear_current(self) -> None:
+        self.signal = None
+        self.processed_signal = None
+        self.current_path = None
+        self.feature_rows = []
+        self.last_auto_adjustment = ""
+        self.channel_panel.clear()
+        self.feature_table.setRowCount(0)
+        self.display.clear_all()
+        self._set_step(0)
+        self.control_panel.set_ready("已清除当前内容")
+        self.statusBar().showMessage("已清除当前页面内容")
 
     def _refresh_time_plot(self) -> None:
         if self.signal is None:
@@ -200,13 +247,25 @@ class MainWindow(QMainWindow):
             return
         visible = self._visible_data()
         if not visible:
-            self.statusBar().showMessage("未选择可显示通道")
+            self.statusBar().showMessage("没有勾选需要显示的通道")
             return
+        plot_channels = dict(visible)
+        colors = self.channel_panel.channel_colors()
+        if self.control_panel.toneburst_preview_check.isChecked():
+            amplitude = max(float(np.max(np.abs(values))) for values in visible.values())
+            toneburst = generate_toneburst_preview(
+                self.signal.time,
+                self.control_panel.center_input.value(),
+                self.control_panel.filter_cycles_input.value(),
+                amplitude=amplitude if amplitude > 0 else 1.0,
+            )
+            plot_channels["Toneburst"] = toneburst
+            colors["Toneburst"] = "#10B981"
         time, unit = self._display_time()
         self.display.plot_time_multi(
             time,
-            visible,
-            self.channel_panel.channel_colors(),
+            plot_channels,
+            colors,
             normalize=self.control_panel.normalize_check.isChecked(),
             stacked=self.control_panel.stacked_check.isChecked(),
             grid=self.control_panel.grid_check.isChecked(),
@@ -218,7 +277,7 @@ class MainWindow(QMainWindow):
             return
         try:
             self._validate_filter()
-            self.control_panel.set_busy(True, "正在进行窄带提取...")
+            self.control_panel.set_busy(True, "正在进行窄带提取与 Hilbert 特征准备...")
             QApplication.processEvents()
             lowcut, highcut = self.control_panel.center_band()
             filtered = {
@@ -250,7 +309,7 @@ class MainWindow(QMainWindow):
         self.control_panel.set_ready(ready_message)
         self._set_step(2)
         self._refresh_time_plot()
-        self.statusBar().showMessage(f"{ready_message}，可查看频谱或导出 CSV")
+        self.statusBar().showMessage(f"{ready_message}，可查看频谱、计算特征或导出 CSV")
 
     def _run_fft(self) -> None:
         if not self._require_signal():
@@ -289,18 +348,18 @@ class MainWindow(QMainWindow):
             return
         self._set_step(3)
         self.display.show_features()
-        self.statusBar().showMessage("特征参数已计算完成")
+        self.statusBar().showMessage("特征参数已更新，包含 Hilbert 包络 TOF 和能量特征")
 
     def _run_wavelet(self) -> None:
         if not self._require_signal():
             return
         visible = self._visible_data()
         if not visible:
-            self._show_error("小波变换失败", "请至少选择一个通道。")
+            self._show_error("小波变换失败", "请先勾选至少一个通道。")
             return
         try:
             self._validate_wavelet()
-            self.control_panel.set_busy(True, "正在生成小波图...")
+            self.control_panel.set_busy(True, "正在生成小波时频图...")
             QApplication.processEvents()
             name, values = next(iter(visible.items()))
             freqs, coefficients = compute_cwt(
@@ -313,14 +372,15 @@ class MainWindow(QMainWindow):
             )
             self.display.plot_wavelet(coefficients, self.signal.time, freqs)
         except Exception as exc:
-            self.control_panel.set_ready("小波生成失败")
-            self._show_error("小波生成失败", _friendly_error(exc))
+            self.control_panel.set_ready("小波图生成失败")
+            self._show_error("小波图生成失败", _friendly_error(exc))
             return
-        self.control_panel.set_ready(f"小波图已生成：{name}")
+        message = f"小波图已生成：{name}"
         if self.last_auto_adjustment:
-            self.control_panel.set_ready(f"小波图已生成：{name}；{self.last_auto_adjustment}")
+            message = f"{message}；{self.last_auto_adjustment}"
+        self.control_panel.set_ready(message)
         self._set_step(3)
-        self.statusBar().showMessage(f"小波图已生成：{name}")
+        self.statusBar().showMessage(message)
 
     def _run_ai_adjustment(self) -> None:
         if not self._require_signal():
@@ -330,7 +390,7 @@ class MainWindow(QMainWindow):
         try:
             if config.enabled:
                 if not config.api_key:
-                    raise ValueError("请先填写 API Key，或关闭“启用大模型 API”。")
+                    raise ValueError("请填写 API Key，或关闭“启用大模型 API”使用本地自动建议。")
                 suggestion = suggest_analysis_parameters(
                     self.signal.time, self.signal.channels, self.signal.sample_rate, config
                 )
@@ -338,7 +398,7 @@ class MainWindow(QMainWindow):
                 suggestion = self._local_parameter_suggestion()
             message = self._apply_parameter_suggestion(suggestion)
         except Exception as exc:
-            self._show_error("智能识别失败", _friendly_error(exc))
+            self._show_error("智能识别参数失败", _friendly_error(exc))
             return
         QMessageBox.information(self, "智能识别参数", message)
         self.control_panel.set_ready(message)
@@ -361,7 +421,7 @@ class MainWindow(QMainWindow):
 
     def _export_features_csv(self) -> None:
         if not self.feature_rows:
-            self._show_error("导出失败", "请先点击“计算特征”。")
+            self._show_error("导出失败", "请先计算特征参数。")
             return
         path, _ = QFileDialog.getSaveFileName(self, "导出特征表 CSV", "", "CSV (*.csv)")
         if not path:
@@ -372,7 +432,7 @@ class MainWindow(QMainWindow):
             writer.writeheader()
             writer.writerows(self.feature_rows)
         self._set_step(4)
-        self.statusBar().showMessage(f"特征表导出成功：{path}")
+        self.statusBar().showMessage(f"特征表已导出：{path}")
 
     def _export_current_image(self) -> None:
         path, _ = QFileDialog.getSaveFileName(
@@ -407,7 +467,7 @@ class MainWindow(QMainWindow):
             "cwt_min_hz": max(center - bandwidth, nyquist * 0.01),
             "cwt_max_hz": min(center + bandwidth * 2.0, nyquist * 0.95),
             "cwt_points": self.control_panel.cwt_points_input.value(),
-            "reason": "基于当前信号主频的本地自动建议。",
+            "reason": "根据当前信号主频自动估计。",
         }
 
     def _apply_parameter_suggestion(self, suggestion: dict) -> str:
@@ -436,8 +496,11 @@ class MainWindow(QMainWindow):
         cwt_points = int(_coerce_float(suggestion.get("cwt_points"), self.control_panel.cwt_points_input.value()))
         self.control_panel.cwt_points_input.setValue(min(max(cwt_points, 8), 512))
 
-        reason = str(suggestion.get("reason") or "已根据当前数据自动调整参数。")
-        return f"参数已调整：中心频率 {self.control_panel.center_input.value():.6g} Hz，带宽 {self.control_panel.bandwidth_input.value():.6g} Hz；{reason}"
+        reason = str(suggestion.get("reason") or "已根据当前信号自动调整。")
+        return (
+            f"参数已调整：中心频率 {self.control_panel.center_input.value():.6g} Hz，"
+            f"带宽 {self.control_panel.bandwidth_input.value():.6g} Hz。{reason}"
+        )
 
     def _visible_data(self) -> dict[str, np.ndarray]:
         source = self.processed_signal or self.signal
@@ -445,12 +508,6 @@ class MainWindow(QMainWindow):
             return {}
         visible = self.channel_panel.visible_channels()
         return {name: source.channels[name] for name in visible if name in source.channels}
-
-    def _raw_visible_data(self) -> dict[str, np.ndarray]:
-        if self.signal is None:
-            return {}
-        visible = self.channel_panel.visible_channels()
-        return {name: self.signal.channels[name] for name in visible if name in self.signal.channels}
 
     def _display_time(self) -> tuple[np.ndarray, str]:
         assert self.signal is not None
@@ -465,9 +522,7 @@ class MainWindow(QMainWindow):
         self.last_auto_adjustment = ""
         if lowcut <= 0 or highcut >= nyquist:
             lowcut, highcut = self._auto_adjust_filter_band(fs)
-            self.last_auto_adjustment = (
-                f"已自动调整滤波范围为 {lowcut:.6g} Hz - {highcut:.6g} Hz"
-            )
+            self.last_auto_adjustment = f"已自动调整滤波范围到 {lowcut:.6g} Hz - {highcut:.6g} Hz"
         self.control_panel.lowcut_input.setValue(lowcut)
         self.control_panel.highcut_input.setValue(highcut)
 
@@ -508,9 +563,7 @@ class MainWindow(QMainWindow):
         self.last_auto_adjustment = ""
         if f_min <= 0 or f_max >= nyquist or f_min >= f_max:
             f_min, f_max = self._auto_adjust_wavelet_range(fs)
-            self.last_auto_adjustment = (
-                f"已自动调整小波频率范围为 {f_min:.6g} Hz - {f_max:.6g} Hz"
-            )
+            self.last_auto_adjustment = f"已自动调整小波频率范围到 {f_min:.6g} Hz - {f_max:.6g} Hz"
 
     def _auto_adjust_wavelet_range(self, fs: float) -> tuple[float, float]:
         nyquist = fs / 2.0
@@ -528,7 +581,7 @@ class MainWindow(QMainWindow):
     def _require_signal(self) -> bool:
         if self.signal is not None:
             return True
-        self._show_error("缺少数据", "请先导入 CSV/TXT 信号文件。")
+        self._show_error("缺少数据", "请先导入 CSV/TXT 或其他信号文件。")
         return False
 
     def _fill_feature_table(self, rows: list[dict[str, float | str]]) -> None:
@@ -665,7 +718,7 @@ class MainWindow(QMainWindow):
                 color: white;
             }
             QLabel#statusHint {
-                color: #10B981;
+                color: #047857;
                 background: #ECFDF5;
                 border: 1px solid #BBF7D0;
                 border-radius: 7px;
@@ -673,6 +726,34 @@ class MainWindow(QMainWindow):
             }
             """
         )
+
+
+def _combine_signals_as_channels(paths: list[Path], signals: list[MultiChannelSignal]) -> MultiChannelSignal:
+    if not signals:
+        raise ValueError("No signals were loaded.")
+    base_fs = signals[0].sample_rate
+    for signal in signals[1:]:
+        relative = abs(signal.sample_rate - base_fs) / base_fs
+        if relative > 1e-3:
+            raise ValueError("多文件采样率不一致，请分别导入或统一采样率后再合并。")
+
+    min_len = min(signal.time.size for signal in signals)
+    channels: dict[str, np.ndarray] = {}
+    for path, signal in zip(paths, signals):
+        for channel_name, values in signal.channels.items():
+            if len(channels) >= 8:
+                break
+            merged_name = f"{path.stem}:{channel_name}" if len(signals) > 1 else str(channel_name)
+            channels[merged_name] = values[:min_len]
+        if len(channels) >= 8:
+            break
+    return MultiChannelSignal(
+        name=f"{len(paths)} files",
+        time=signals[0].time[:min_len],
+        channels=channels,
+        sample_rate=base_fs,
+        metadata={"source_files": [str(path) for path in paths], "truncated_samples": min_len},
+    )
 
 
 def _coerce_float(value: object, default: float) -> float:
@@ -683,11 +764,17 @@ def _coerce_float(value: object, default: float) -> float:
 
 
 def _friendly_error(error: Exception | str) -> str:
+    if isinstance(error, _UserCancelled):
+        return "已取消导入。"
     text = str(error)
     if "sample_rate is required" in text:
-        return "无法识别采样率，请在导入预览窗口中手动输入采样率。"
+        return "无法识别采样率，请在导入窗口或右侧采样率输入框中手动填写采样率。"
     if "Nyquist" in text or "highcut" in text:
-        return "滤波上限频率不能超过 Nyquist 频率。"
+        return "滤波上限频率不能超过 Nyquist 频率，软件会优先尝试自动调整。"
     if "Unsupported file type" in text:
-        return "当前文件格式暂不支持，请使用 CSV/TXT 或常见科学数据格式。"
+        return "当前文件格式暂不支持。建议使用 CSV/TXT、Excel、NPY/NPZ 或 MAT 文件。"
     return text
+
+
+class _UserCancelled(Exception):
+    """Internal marker for cancelled import dialogs."""

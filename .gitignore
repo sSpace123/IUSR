@@ -3,5 +3,5 @@
 .uv-cache/
 __pycache__/
 *.py[cod]
+.env
 ui_preview.png
-

@@ -20,7 +20,7 @@ from PySide6.QtWidgets import (
 )
 
 from app.ui_helpers import make_primary_button, make_secondary_button
-from core.ai_assistant import AIConfig
+from core.ai_assistant import AIConfig, load_local_ai_config
 
 
 class ControlPanel(QWidget):
@@ -39,6 +39,7 @@ class ControlPanel(QWidget):
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.setObjectName("sidePanel")
+        local_ai = load_local_ai_config(enabled=False)
 
         self.sample_rate_input = self._double_input(1_000_000.0, " Hz")
         self.center_input = self._double_input(500_000.0, " Hz")
@@ -68,16 +69,17 @@ class ControlPanel(QWidget):
         self.stacked_check = QCheckBox("分通道错位显示")
         self.grid_check = QCheckBox("显示网格")
         self.grid_check.setChecked(True)
+        self.toneburst_preview_check = QCheckBox("生成 Toneburst 平滑预览")
         self.time_unit_combo = QComboBox()
         self.time_unit_combo.addItems(["s", "ms", "us"])
 
         self.ai_enable_check = QCheckBox("启用大模型 API")
-        self.ai_base_url_input = QLineEdit("https://api.openai.com/v1")
-        self.ai_model_input = QLineEdit("gpt-4o-mini")
-        self.ai_key_input = QLineEdit()
+        self.ai_base_url_input = QLineEdit(local_ai.base_url)
+        self.ai_model_input = QLineEdit(local_ai.model)
+        self.ai_key_input = QLineEdit(local_ai.api_key)
         self.ai_key_input.setEchoMode(QLineEdit.EchoMode.Password)
 
-        self.status_label = QLabel("等待导入数据")
+        self.status_label = QLabel("就绪：请导入信号文件")
         self.status_label.setObjectName("statusHint")
 
         self._build_layout()
@@ -104,8 +106,8 @@ class ControlPanel(QWidget):
         return AIConfig(
             enabled=self.ai_enable_check.isChecked(),
             api_key=self.ai_key_input.text().strip(),
-            base_url=self.ai_base_url_input.text().strip() or "https://api.openai.com/v1",
-            model=self.ai_model_input.text().strip() or "gpt-4o-mini",
+            base_url=self.ai_base_url_input.text().strip() or "https://api.deepseek.com/v1",
+            model=self.ai_model_input.text().strip() or "deepseek-chat",
         )
 
     def _build_layout(self) -> None:
@@ -131,7 +133,7 @@ class ControlPanel(QWidget):
         filter_form = QFormLayout()
         filter_form.addRow("中心频率", self.center_input)
         filter_form.addRow("带宽", self.bandwidth_input)
-        filter_form.addRow("滤波后周期", self.filter_cycles_input)
+        filter_form.addRow("滤波周期", self.filter_cycles_input)
         filter_layout.addLayout(filter_form)
         advanced_button = QToolButton()
         advanced_button.setText("高级设置")
@@ -170,6 +172,7 @@ class ControlPanel(QWidget):
         display_form.addRow(self.normalize_check)
         display_form.addRow(self.stacked_check)
         display_form.addRow(self.grid_check)
+        display_form.addRow(self.toneburst_preview_check)
         display_form.addRow("时间单位", self.time_unit_combo)
         layout.addWidget(display_box)
 
@@ -205,12 +208,13 @@ class ControlPanel(QWidget):
             self.normalize_check,
             self.stacked_check,
             self.grid_check,
+            self.toneburst_preview_check,
             self.time_unit_combo,
         ):
             if isinstance(widget, QComboBox):
-                widget.currentTextChanged.connect(self.display_changed.emit)
+                widget.currentTextChanged.connect(lambda _text: self.display_changed.emit())
             else:
-                widget.stateChanged.connect(self.display_changed.emit)
+                widget.stateChanged.connect(lambda _state: self.display_changed.emit())
 
     def _double_input(self, value: float, suffix: str) -> QDoubleSpinBox:
         spin = QDoubleSpinBox()
@@ -219,4 +223,3 @@ class ControlPanel(QWidget):
         spin.setValue(value)
         spin.setSuffix(suffix)
         return spin
-

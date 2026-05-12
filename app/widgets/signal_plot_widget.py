@@ -20,7 +20,7 @@ CHANNEL_COLORS = [
 
 
 class AnalysisDisplayWidget(QWidget):
-    """Central display for time-domain, spectrum, wavelet, and empty states."""
+    """Central display for time-domain, spectrum, wavelet, and feature views."""
 
     def __init__(self, feature_table: QTableWidget, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -29,14 +29,22 @@ class AnalysisDisplayWidget(QWidget):
         self.tabs = QTabWidget()
         self.time_stack = QStackedWidget()
         self.empty_label = QLabel(
-            "拖拽 CSV/TXT 文件到此处，或点击“导入数据”\n支持单通道和最多 8 通道信号"
+            "拖拽 CSV/TXT 文件到此处，或点击“导入数据”\n支持单通道、多通道和最多 8 个文件/通道显示"
         )
         self.empty_label.setObjectName("emptyState")
         self.empty_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
         self.time_plot = pg.PlotWidget(title="时域信号")
         self.spectrum_plot = pg.PlotWidget(title="频域信号")
-        self.wavelet_view = pg.ImageView()
+        self.wavelet_widget = pg.GraphicsLayoutWidget()
+        self.wavelet_plot = self.wavelet_widget.addPlot(title="小波时频图")
+        self.wavelet_image = pg.ImageItem(axisOrder="row-major")
+        self.wavelet_plot.addItem(self.wavelet_image)
+        self.wavelet_plot.setLabel("bottom", "Time", units="s")
+        self.wavelet_plot.setLabel("left", "Frequency", units="Hz")
+        self.wavelet_plot.showGrid(x=True, y=True, alpha=0.18)
+        self.wavelet_plot.setLimits(xMin=0)
+        self.wavelet_colorbar = _make_colorbar(self.wavelet_image, self.wavelet_plot)
 
         for plot in (self.time_plot, self.spectrum_plot):
             plot.showGrid(x=True, y=True, alpha=0.22)
@@ -46,7 +54,7 @@ class AnalysisDisplayWidget(QWidget):
         self.time_stack.addWidget(self.time_plot)
         self.tabs.addTab(self.time_stack, "时域信号")
         self.tabs.addTab(self.spectrum_plot, "频域信号")
-        self.tabs.addTab(self.wavelet_view, "小波变换")
+        self.tabs.addTab(self.wavelet_widget, "小波变换")
         self.tabs.addTab(self.feature_table, "特征参数")
 
         layout = QVBoxLayout(self)
@@ -69,11 +77,18 @@ class AnalysisDisplayWidget(QWidget):
 
     def show_wavelet(self) -> None:
         """Show wavelet page."""
-        self.tabs.setCurrentWidget(self.wavelet_view)
+        self.tabs.setCurrentWidget(self.wavelet_widget)
 
     def show_features(self) -> None:
         """Show feature table page."""
         self.tabs.setCurrentWidget(self.feature_table)
+
+    def clear_all(self) -> None:
+        """Clear plots and return to the empty state."""
+        self.time_plot.clear()
+        self.spectrum_plot.clear()
+        self.wavelet_image.setImage(np.zeros((1, 1)), autoLevels=False)
+        self.show_empty()
 
     def plot_time_multi(
         self,
@@ -87,16 +102,17 @@ class AnalysisDisplayWidget(QWidget):
     ) -> None:
         """Plot visible channels in the time domain."""
         self.time_plot.clear()
+        self.time_plot.addLegend(offset=(8, 8))
         self.time_plot.showGrid(x=grid, y=grid, alpha=0.22)
         for index, (name, values) in enumerate(channels.items()):
             x, y = _downsample_for_display(time, values)
             y = _normalize(y) if normalize else y.copy()
             if stacked:
                 y = y + index * 2.2
-            self.time_plot.plot(x, y, pen=pg.mkPen(colors[name], width=1.35), name=name)
+            color = colors.get(name, CHANNEL_COLORS[index % len(CHANNEL_COLORS)])
+            self.time_plot.plot(x, y, pen=pg.mkPen(color, width=1.35), name=name)
         self.time_plot.setLabel("bottom", "Time", units=time_unit)
         self.time_plot.setLabel("left", "Amplitude")
-        self.time_plot.addLegend(offset=(8, 8))
         self.show_time()
 
     def plot_spectrum_multi(
@@ -107,28 +123,53 @@ class AnalysisDisplayWidget(QWidget):
     ) -> None:
         """Plot visible channel FFT spectra and mark dominant frequencies."""
         self.spectrum_plot.clear()
+        self.spectrum_plot.addLegend(offset=(8, 8))
         self.spectrum_plot.showGrid(x=grid, y=grid, alpha=0.22)
-        for name, (freqs, amplitudes, dominant) in spectra.items():
+        for index, (name, (freqs, amplitudes, dominant)) in enumerate(spectra.items()):
             x, y = _downsample_for_display(freqs, amplitudes)
-            self.spectrum_plot.plot(x, y, pen=pg.mkPen(colors[name], width=1.35), name=name)
-            marker = pg.InfiniteLine(
-                pos=dominant,
-                angle=90,
-                pen=pg.mkPen(colors[name], width=1, style=Qt.PenStyle.DashLine),
+            color = colors.get(name, CHANNEL_COLORS[index % len(CHANNEL_COLORS)])
+            self.spectrum_plot.plot(x, y, pen=pg.mkPen(color, width=1.35), name=name)
+            self.spectrum_plot.addItem(
+                pg.InfiniteLine(
+                    pos=dominant,
+                    angle=90,
+                    pen=pg.mkPen(color, width=1, style=Qt.PenStyle.DashLine),
+                )
             )
-            self.spectrum_plot.addItem(marker)
         self.spectrum_plot.setLabel("bottom", "Frequency", units="Hz")
         self.spectrum_plot.setLabel("left", "Amplitude")
-        self.spectrum_plot.addLegend(offset=(8, 8))
         self.show_spectrum()
 
     def plot_wavelet(self, coefficients: np.ndarray, time: np.ndarray, freqs: np.ndarray) -> None:
-        """Display a CWT coefficient matrix with a color scale."""
+        """Display a CWT coefficient matrix with a scientific heatmap."""
+        if coefficients.ndim != 2:
+            raise ValueError("CWT coefficients must be a 2-D matrix.")
         magnitude = np.abs(coefficients)
-        self.wavelet_view.setImage(magnitude.T, autoLevels=True)
+        if magnitude.shape[0] != freqs.size:
+            magnitude = magnitude.T
+        if magnitude.shape[0] != freqs.size or magnitude.shape[1] != time.size:
+            raise ValueError("CWT matrix shape does not match time/frequency axes.")
+
+        finite = magnitude[np.isfinite(magnitude)]
+        if finite.size == 0:
+            raise ValueError("CWT result contains no finite values.")
+        lower, upper = np.percentile(finite, [2, 98])
+        if lower == upper:
+            lower, upper = float(finite.min()), float(finite.max() or 1.0)
+
+        self.wavelet_image.setImage(magnitude, autoLevels=False)
+        self.wavelet_image.setLevels((float(lower), float(upper)))
         if time.size > 1 and freqs.size > 1:
-            rect = QRectF(time[0], freqs[0], time[-1] - time[0], freqs[-1] - freqs[0])
-            self.wavelet_view.imageItem.setRect(rect)
+            rect = QRectF(
+                float(time[0]),
+                float(freqs[0]),
+                float(time[-1] - time[0]),
+                float(freqs[-1] - freqs[0]),
+            )
+            self.wavelet_image.setRect(rect)
+            self.wavelet_plot.setXRange(float(time[0]), float(time[-1]), padding=0.01)
+            self.wavelet_plot.setYRange(float(freqs[0]), float(freqs[-1]), padding=0.01)
+        _update_colorbar(self.wavelet_colorbar, float(lower), float(upper))
         self.show_wavelet()
 
     def reset_view(self) -> None:
@@ -136,6 +177,8 @@ class AnalysisDisplayWidget(QWidget):
         current = self.tabs.currentWidget()
         if current is self.time_stack:
             current = self.time_plot
+        if current is self.wavelet_widget:
+            current = self.wavelet_plot
         if hasattr(current, "autoRange"):
             current.autoRange()
 
@@ -144,6 +187,26 @@ class AnalysisDisplayWidget(QWidget):
         pixmap = self.tabs.currentWidget().grab()
         if not pixmap.save(path):
             raise ValueError(f"Could not save image to {path}")
+
+
+def _make_colorbar(image: pg.ImageItem, plot: pg.PlotItem):
+    try:
+        cmap = pg.colormap.get("viridis")
+        image.setLookupTable(cmap.getLookupTable(0.0, 1.0, 256))
+        colorbar = pg.ColorBarItem(values=(0.0, 1.0), colorMap=cmap)
+        colorbar.setImageItem(image, insert_in=plot)
+        return colorbar
+    except Exception:
+        return None
+
+
+def _update_colorbar(colorbar: object, lower: float, upper: float) -> None:
+    if colorbar is None:
+        return
+    try:
+        colorbar.setLevels((lower, upper))
+    except Exception:
+        pass
 
 
 def _normalize(values: np.ndarray) -> np.ndarray:

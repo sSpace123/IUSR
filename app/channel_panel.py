@@ -26,6 +26,7 @@ class ChannelPanel(QWidget):
     """Manage imports, file summary, and channel visibility."""
 
     import_requested = Signal()
+    clear_requested = Signal()
     visibility_changed = Signal()
 
     def __init__(self, parent: QWidget | None = None) -> None:
@@ -35,6 +36,7 @@ class ChannelPanel(QWidget):
 
         self.import_button = make_primary_button("导入数据")
         self.reimport_button = make_secondary_button("重新导入")
+        self.clear_button = make_secondary_button("清除当前内容")
         self.file_name = QLabel("未导入文件")
         self.sample_rate = QLabel("-")
         self.sample_count = QLabel("-")
@@ -45,6 +47,7 @@ class ChannelPanel(QWidget):
         self._build_layout()
         self.import_button.clicked.connect(self.import_requested.emit)
         self.reimport_button.clicked.connect(self.import_requested.emit)
+        self.clear_button.clicked.connect(self.clear_requested.emit)
 
     def visible_channels(self) -> list[str]:
         """Return currently checked channels."""
@@ -81,6 +84,7 @@ class ChannelPanel(QWidget):
         layout.setSpacing(12)
         layout.addWidget(self.import_button)
         layout.addWidget(self.reimport_button)
+        layout.addWidget(self.clear_button)
 
         info_box = QGroupBox("文件信息")
         info_grid = QGridLayout(info_box)
@@ -132,9 +136,8 @@ class ChannelPanel(QWidget):
             )
             checkbox = QCheckBox(name)
             checkbox.setChecked(True)
-            checkbox.stateChanged.connect(self.visibility_changed.emit)
+            checkbox.stateChanged.connect(lambda _state: self.visibility_changed.emit())
             self._checks[name] = checkbox
             row_layout.addWidget(color)
             row_layout.addWidget(checkbox, 1)
             self.channel_list.addWidget(row)
-
