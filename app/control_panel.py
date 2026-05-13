@@ -70,6 +70,8 @@ class ControlPanel(QWidget):
         self.grid_check = QCheckBox("显示网格")
         self.grid_check.setChecked(True)
         self.toneburst_preview_check = QCheckBox("生成 Toneburst 平滑预览")
+        self.filtered_envelope_check = QCheckBox("窄带后显示 Hilbert 包络")
+        self.filtered_envelope_check.setChecked(True)
         self.time_unit_combo = QComboBox()
         self.time_unit_combo.addItems(["s", "ms", "us"])
 
@@ -173,6 +175,7 @@ class ControlPanel(QWidget):
         display_form.addRow(self.stacked_check)
         display_form.addRow(self.grid_check)
         display_form.addRow(self.toneburst_preview_check)
+        display_form.addRow(self.filtered_envelope_check)
         display_form.addRow("时间单位", self.time_unit_combo)
         layout.addWidget(display_box)
 
@@ -209,6 +212,7 @@ class ControlPanel(QWidget):
             self.stacked_check,
             self.grid_check,
             self.toneburst_preview_check,
+            self.filtered_envelope_check,
             self.time_unit_combo,
         ):
             if isinstance(widget, QComboBox):

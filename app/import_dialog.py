@@ -241,7 +241,11 @@ class ImportDialog(QDialog):
             suggestion = suggest_import_options(self.preview, self.ai_config)
             self._apply_ai_import_suggestion(suggestion)
         except Exception as exc:
-            QMessageBox.warning(self, "AI Assistant", str(exc))
+            QMessageBox.warning(
+                self,
+                "AI Assistant",
+                f"AI API 连接失败，已保留当前本地识别结果。\n\n{exc}",
+            )
 
     def _apply_ai_import_suggestion(self, suggestion: dict) -> None:
         if "skip_rows" in suggestion:

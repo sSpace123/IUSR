@@ -1,8 +1,9 @@
-"""Main window for the ultrasonic signal analyzer desktop application."""
+"""Main window for the ultrasonic signal analyzer."""
 
 from __future__ import annotations
 
 import csv
+import json
 from pathlib import Path
 
 import numpy as np
@@ -18,36 +19,45 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMessageBox,
     QSplitter,
-    QTableWidget,
-    QTableWidgetItem,
+    QStatusBar,
     QVBoxLayout,
     QWidget,
 )
 
-from app.channel_panel import ChannelPanel
-from app.control_panel import ControlPanel
 from app.import_dialog import ImportDialog
-from app.ui_helpers import make_step_label
+from app.left_panel import LeftPanel
+from app.right_panel import RightPanel
+from app.style_manager import stylesheet
+from app.ui_helpers import format_rate, make_step_label
 from app.widgets.signal_plot_widget import AnalysisDisplayWidget
+from app.workers import CWTWorker, FeatureWorker, FilteringWorker
 from core.ai_assistant import suggest_analysis_parameters
 from core.data_loader import DataImportOptions, load_signal_file
 from core.export import export_signal_csv
-from core.feature_extraction import compute_basic_features
+from core.feature_extraction import compute_basic_features, hilbert_envelope
 from core.filtering import narrowband_filter
 from core.signal_data import MultiChannelSignal
-from core.spectrum_analysis import compute_fft
+from core.spectrum_analysis import compute_fft, find_dominant_frequency
+from core.units import (
+    auto_time_unit,
+    format_frequency,
+    format_time,
+    frequency_to_hz,
+    hz_to_frequency,
+    time_to_seconds,
+)
+from core.wavelet_analysis import estimate_cwt_cost, prepare_signal_for_cwt
 from core.toneburst import generate_toneburst_preview
-from core.wavelet_analysis import compute_cwt
 
 
 class MainWindow(QMainWindow):
-    """Research-friendly but simple desktop workflow."""
+    """Ultrasonic signal analyzer with three-column research workflow."""
 
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("超声信号分析软件")
         self.resize(1420, 860)
-        self.setMinimumSize(960, 640)
+        self.setMinimumSize(1280, 760)
         self.setAcceptDrops(True)
 
         self.signal: MultiChannelSignal | None = None
@@ -56,26 +66,20 @@ class MainWindow(QMainWindow):
         self.feature_rows: list[dict[str, float | str]] = []
         self.last_auto_adjustment = ""
 
-        self.channel_panel = ChannelPanel()
-        self.control_panel = ControlPanel()
-        self.feature_table = QTableWidget(0, 12)
-        self.feature_table.setHorizontalHeaderLabels(
-            [
-                "Channel",
-                "Peak",
-                "Peak-Peak",
-                "RMS",
-                "Energy",
-                "Avg Power",
-                "Envelope Energy",
-                "Envelope Area",
-                "Dominant Freq",
-                "Peak Time",
-                "TOF",
-                "Envelope Peak",
-            ]
-        )
-        self.display = AnalysisDisplayWidget(self.feature_table)
+        # Cached narrowband result for export
+        self._narrowband_result: dict | None = None
+
+        # Workers
+        self._cwt_worker: CWTWorker | None = None
+        self._filter_worker: FilteringWorker | None = None
+        self._feature_worker: FeatureWorker | None = None
+
+        # Panels
+        self.left_panel = LeftPanel()
+        self.right_panel = RightPanel()
+        self.display = AnalysisDisplayWidget()
+
+        # Top flow steps
         self.step_labels = [
             make_step_label("1 导入数据", True),
             make_step_label("2 信号处理"),
@@ -83,40 +87,50 @@ class MainWindow(QMainWindow):
             make_step_label("4 结果导出"),
         ]
 
+        # Status bar labels
+        self._status_state = QLabel("就绪")
+        self._status_file = QLabel("—")
+        self._status_rate = QLabel("—")
+        self._status_channels = QLabel("—")
+        self._status_view = QLabel("—")
+
         self._build_layout()
+        self._build_statusbar()
         self._connect_signals()
         self._apply_style()
         self._set_step(0)
-        self.display.show_empty()
-        self.statusBar().showMessage("就绪：请导入 CSV/TXT 或拖拽多个文件到窗口")
+
+    # ── Drag & drop ──
 
     def dragEnterEvent(self, event: QDragEnterEvent) -> None:
-        """Accept dropped local files."""
         if event.mimeData().hasUrls():
             event.acceptProposedAction()
 
     def dropEvent(self, event: QDropEvent) -> None:
-        """Load one or more dropped files as channels."""
         paths = [Path(url.toLocalFile()) for url in event.mimeData().urls() if url.isLocalFile()]
         if paths:
             self._load_paths(paths)
 
+    # ── Layout ──
+
     def _build_layout(self) -> None:
         shell = QWidget()
         shell_layout = QVBoxLayout(shell)
-        shell_layout.setContentsMargins(12, 12, 12, 8)
-        shell_layout.setSpacing(10)
+        shell_layout.setContentsMargins(12, 10, 12, 6)
+        shell_layout.setSpacing(8)
 
         top = QFrame()
         top.setObjectName("topBar")
         top_layout = QHBoxLayout(top)
+        top_layout.setContentsMargins(12, 8, 12, 8)
         title = QLabel("超声信号分析软件")
         title.setObjectName("appTitle")
         top_layout.addWidget(title)
         top_layout.addStretch(1)
-        for index, step in enumerate(self.step_labels):
+        for i, step in enumerate(self.step_labels):
+            step.setObjectName("stepLabel")
             top_layout.addWidget(step)
-            if index < len(self.step_labels) - 1:
+            if i < len(self.step_labels) - 1:
                 arrow = QLabel("→")
                 arrow.setObjectName("stepArrow")
                 top_layout.addWidget(arrow)
@@ -124,30 +138,81 @@ class MainWindow(QMainWindow):
 
         splitter = QSplitter(Qt.Orientation.Horizontal)
         splitter.setChildrenCollapsible(False)
-        splitter.addWidget(self.channel_panel)
+        splitter.setHandleWidth(3)
+        splitter.addWidget(self.left_panel)
         splitter.addWidget(self.display)
-        splitter.addWidget(self.control_panel)
+        splitter.addWidget(self.right_panel)
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
         splitter.setStretchFactor(2, 0)
-        splitter.setSizes([250, 900, 310])
-        shell_layout.addWidget(splitter, 1)
+        splitter.setSizes([240, 800, 320])
 
+        shell_layout.addWidget(splitter, 1)
         self.setCentralWidget(shell)
 
+    def _build_statusbar(self) -> None:
+        bar = QStatusBar()
+        bar.setSizeGripEnabled(True)
+
+        def _sep():
+            lbl = QLabel("|")
+            lbl.setStyleSheet("color:#D1D5DB;")
+            bar.addPermanentWidget(lbl)
+
+        bar.addWidget(QLabel("状态："))
+        bar.addWidget(self._status_state)
+        _sep()
+        bar.addWidget(QLabel("文件："))
+        bar.addWidget(self._status_file)
+        _sep()
+        bar.addWidget(QLabel("采样率："))
+        bar.addWidget(self._status_rate)
+        _sep()
+        bar.addWidget(QLabel("通道："))
+        bar.addWidget(self._status_channels)
+        _sep()
+        bar.addWidget(QLabel("视图："))
+        bar.addWidget(self._status_view)
+        self.setStatusBar(bar)
+
+    def _update_status(self, state: str = "", file: str = "", rate: str = "",
+                       channels: str = "", view: str = "") -> None:
+        if state:
+            self._status_state.setText(state)
+        if file:
+            self._status_file.setText(file)
+        if rate:
+            self._status_rate.setText(rate)
+        if channels:
+            self._status_channels.setText(channels)
+        if view:
+            self._status_view.setText(view)
+
+    def _apply_style(self) -> None:
+        self.setStyleSheet(stylesheet())
+
+    # ── Signals ──
+
     def _connect_signals(self) -> None:
-        self.channel_panel.import_requested.connect(self._choose_file)
-        self.channel_panel.clear_requested.connect(self._clear_current)
-        self.channel_panel.visibility_changed.connect(self._refresh_time_plot)
-        self.control_panel.display_changed.connect(self._refresh_time_plot)
-        self.control_panel.fft_requested.connect(self._run_fft)
-        self.control_panel.filter_requested.connect(self._run_filter)
-        self.control_panel.features_requested.connect(self._run_features)
-        self.control_panel.wavelet_requested.connect(self._run_wavelet)
-        self.control_panel.export_signal_requested.connect(self._export_signal_csv)
-        self.control_panel.export_features_requested.connect(self._export_features_csv)
-        self.control_panel.export_image_requested.connect(self._export_current_image)
-        self.control_panel.ai_adjust_requested.connect(self._run_ai_adjustment)
+        self.left_panel.import_requested.connect(self._choose_file)
+        self.left_panel.clear_requested.connect(self._clear_current)
+        self.left_panel.visibility_changed.connect(self._refresh_time_plot)
+
+        self.right_panel.display_changed.connect(self._refresh_time_plot)
+        self.right_panel.fft_requested.connect(self._run_fft)
+        self.right_panel.filter_requested.connect(self._run_narrowband_extraction)
+        self.right_panel.features_requested.connect(self._run_features)
+        self.right_panel.wavelet_requested.connect(self._run_wavelet)
+        self.right_panel.wavelet_cancel_requested.connect(self._cancel_wavelet)
+        self.right_panel.export_signal_requested.connect(self._export_narrowband_csv)
+        self.right_panel.export_filtered_signal_requested.connect(self._export_filtered_csv)
+        self.right_panel.export_envelope_requested.connect(self._export_envelope_csv)
+        self.right_panel.export_features_requested.connect(self._export_features_csv)
+        self.right_panel.export_image_requested.connect(self._export_current_image)
+        self.right_panel.ai_adjust_requested.connect(self._run_ai_adjustment)
+        self.display.import_requested.connect(self._choose_file)
+
+    # ── File loading ──
 
     def _choose_file(self) -> None:
         paths, _ = QFileDialog.getOpenFileNames(
@@ -157,7 +222,7 @@ class MainWindow(QMainWindow):
             "Signal Files (*.csv *.txt *.xlsx *.xls *.npy *.npz *.mat);;All Files (*)",
         )
         if paths:
-            self._load_paths([Path(path) for path in paths])
+            self._load_paths([Path(p) for p in paths])
 
     def _load_paths(self, paths: list[Path]) -> None:
         try:
@@ -175,7 +240,11 @@ class MainWindow(QMainWindow):
             if options is None:
                 raise _UserCancelled()
             return load_signal_file(path, options=options)
-        return load_signal_file(path, sample_rate=self.control_panel.sample_rate_input.value())
+        fs = frequency_to_hz(
+            self.right_panel.sample_rate_input.value(),
+            self.right_panel.sample_rate_unit.currentText(),
+        )
+        return load_signal_file(path, sample_rate=fs)
 
     def _load_multi_paths(self, paths: list[Path]) -> MultiChannelSignal:
         options: DataImportOptions | None = None
@@ -185,23 +254,26 @@ class MainWindow(QMainWindow):
                 raise _UserCancelled()
 
         signals: list[MultiChannelSignal] = []
+        fs = frequency_to_hz(
+            self.right_panel.sample_rate_input.value(),
+            self.right_panel.sample_rate_unit.currentText(),
+        )
         for path in paths:
             if path.suffix.lower() in {".csv", ".txt"}:
-                import_options = options or DataImportOptions(
-                    sample_rate=self.control_panel.sample_rate_input.value()
-                )
-                signal = load_signal_file(path, options=import_options)
+                import_opts = options or DataImportOptions(sample_rate=fs)
+                signal = load_signal_file(path, options=import_opts)
             else:
-                signal = load_signal_file(path, sample_rate=self.control_panel.sample_rate_input.value())
+                signal = load_signal_file(path, sample_rate=fs)
             signals.append(signal)
         return _combine_signals_as_channels(paths, signals)
 
     def _ask_import_options(self, path: Path) -> DataImportOptions | None:
+        fs = frequency_to_hz(
+            self.right_panel.sample_rate_input.value(),
+            self.right_panel.sample_rate_unit.currentText(),
+        )
         dialog = ImportDialog(
-            path,
-            self.control_panel.sample_rate_input.value(),
-            self,
-            ai_config=self.control_panel.ai_config(),
+            path, fs, self, ai_config=self.right_panel.ai_config(),
         )
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return None
@@ -213,33 +285,50 @@ class MainWindow(QMainWindow):
         self.processed_signal = None
         self.feature_rows = []
         self.last_auto_adjustment = ""
-        self.control_panel.sample_rate_input.setValue(self.signal.sample_rate)
+        self._narrowband_result = None
+
+        self.right_panel.sample_rate_input.setValue(
+            hz_to_frequency(self.signal.sample_rate, self.right_panel.sample_rate_unit.currentText())
+        )
         self._auto_tune_filter_defaults()
         self._auto_tune_wavelet_defaults()
-        self.channel_panel.update_signal(
+        self.left_panel.update_signal(
             first_path if file_count == 1 else f"{file_count} files",
             self.signal,
         )
-        self.feature_table.setRowCount(0)
+        self.display.feature_widget.clear()
         self._refresh_time_plot()
         self._set_step(1)
-        self.control_panel.set_ready("导入完成：已显示时域信号")
-        self.statusBar().showMessage(
-            f"导入完成 | 采样率 {self.signal.sample_rate:.6g} Hz | 通道 {len(self.signal.channels)}"
+        self.right_panel.set_ready("导入完成：已显示时域信号")
+        self._update_status(
+            state="导入完成",
+            file=Path(first_path).name,
+            rate=format_rate(self.signal.sample_rate),
+            channels=f"{len(self.signal.channels)}",
+            view="时域信号",
         )
 
     def _clear_current(self) -> None:
+        self._cancel_all_workers()
         self.signal = None
         self.processed_signal = None
         self.current_path = None
         self.feature_rows = []
         self.last_auto_adjustment = ""
-        self.channel_panel.clear()
-        self.feature_table.setRowCount(0)
+        self._narrowband_result = None
+        self.left_panel.clear()
         self.display.clear_all()
         self._set_step(0)
-        self.control_panel.set_ready("已清除当前内容")
-        self.statusBar().showMessage("已清除当前页面内容")
+        self.right_panel.set_ready("已清除当前内容")
+        self._update_status(state="就绪", file="—", rate="—", channels="—", view="—")
+
+    def _cancel_all_workers(self) -> None:
+        for w in (self._cwt_worker, self._filter_worker, self._feature_worker):
+            if w is not None and w.isRunning():
+                w.cancel()
+                w.wait(2000)
+
+    # ── Plot refresh ──
 
     def _refresh_time_plot(self) -> None:
         if self.signal is None:
@@ -247,69 +336,138 @@ class MainWindow(QMainWindow):
             return
         visible = self._visible_data()
         if not visible:
-            self.statusBar().showMessage("没有勾选需要显示的通道")
+            self._update_status(state="没有勾选需要显示的通道")
             return
-        plot_channels = dict(visible)
-        colors = self.channel_panel.channel_colors()
-        if self.control_panel.toneburst_preview_check.isChecked():
+
+        plot_channels = self._channels_for_time_display(visible)
+        colors = self.left_panel.channel_colors()
+
+        if self.right_panel.toneburst_preview_check.isChecked():
             amplitude = max(float(np.max(np.abs(values))) for values in visible.values())
             toneburst = generate_toneburst_preview(
                 self.signal.time,
-                self.control_panel.center_input.value(),
-                self.control_panel.filter_cycles_input.value(),
+                self.right_panel.center_freq_hz(),
+                self.right_panel.filter_order_input.value(),
                 amplitude=amplitude if amplitude > 0 else 1.0,
             )
             plot_channels["Toneburst"] = toneburst
             colors["Toneburst"] = "#10B981"
+
         time, unit = self._display_time()
         self.display.plot_time_multi(
-            time,
-            plot_channels,
-            colors,
-            normalize=self.control_panel.normalize_check.isChecked(),
-            stacked=self.control_panel.stacked_check.isChecked(),
-            grid=self.control_panel.grid_check.isChecked(),
+            time, plot_channels, colors,
+            normalize=self.right_panel.normalize_check.isChecked(),
+            stacked=self.right_panel.stacked_check.isChecked(),
+            grid=self.right_panel.grid_check.isChecked(),
             time_unit=unit,
         )
+        self._update_status(view="时域信号")
 
-    def _run_filter(self) -> None:
+    def _channels_for_time_display(self, visible: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
+        if self.processed_signal is not None and self.right_panel.filtered_envelope_check.isChecked():
+            return {
+                f"{name} 包络": _smooth_envelope(values, self.signal.sample_rate)
+                for name, values in visible.items()
+            }
+        return dict(visible)
+
+    # ── Narrowband wave packet extraction ──
+
+    def _run_narrowband_extraction(self) -> None:
         if not self._require_signal():
             return
         try:
-            self._validate_filter()
-            self.control_panel.set_busy(True, "正在进行窄带提取与 Hilbert 特征准备...")
-            QApplication.processEvents()
-            lowcut, highcut = self.control_panel.center_band()
-            filtered = {
-                name: narrowband_filter(
-                    values,
-                    self.control_panel.sample_rate_input.value(),
-                    self.control_panel.center_input.value(),
-                    self.control_panel.bandwidth_input.value(),
-                    order=self.control_panel.filter_order_input.value(),
-                    cycles=self.control_panel.filter_cycles_input.value(),
-                )
-                for name, values in self.signal.channels.items()
-            }
-            self.processed_signal = MultiChannelSignal(
-                name=f"{self.signal.name}-filtered",
-                time=self.signal.time,
-                channels=filtered,
-                sample_rate=self.control_panel.sample_rate_input.value(),
-                metadata={**self.signal.metadata, "lowcut": lowcut, "highcut": highcut},
+            center_hz = self.right_panel.center_freq_hz()
+            bw_hz = self.right_panel.bandwidth_hz()
+            window_s = self.right_panel.window_length_s()
+            center_s = self.right_panel.manual_center_time_s() if not self.right_panel.auto_locate_check.isChecked() else None
+
+            # Validate
+            from core.filtering import validate_bandpass_params
+            lowcut, highcut = validate_bandpass_params(
+                self.signal.sample_rate, center_hz, bw_hz,
             )
-        except Exception as exc:
-            self.control_panel.set_ready("处理失败")
-            self._show_error("处理失败", _friendly_error(exc))
+            self.right_panel.lowcut_input.setValue(
+                hz_to_frequency(lowcut, self.right_panel.lowcut_unit.currentText())
+            )
+            self.right_panel.highcut_input.setValue(
+                hz_to_frequency(highcut, self.right_panel.highcut_unit.currentText())
+            )
+        except ValueError as exc:
+            self._show_error("参数错误", str(exc))
             return
 
-        ready_message = "处理完成，已生成窄带信号"
-        if self.last_auto_adjustment:
-            ready_message = f"{ready_message}；{self.last_auto_adjustment}"
-        self.control_panel.set_ready(ready_message)
+        visible = self._visible_data()
+        if not visible:
+            self._show_error("缺少数据", "请先勾选至少一个通道。")
+            return
+
+        name, values = next(iter(visible.items()))
+
+        self.right_panel.set_busy(True, "正在进行窄带波包提取...")
+        self._update_status(state="正在进行窄带波包提取...")
+
+        self._filter_worker = FilteringWorker(
+            self.signal.time, values, self.signal.sample_rate,
+            center_freq=center_hz,
+            bandwidth=bw_hz,
+            order=self.right_panel.filter_order_input.value(),
+            zero_phase=self.right_panel.zero_phase_check.isChecked(),
+            remove_dc=True,
+            auto_locate=self.right_panel.auto_locate_check.isChecked(),
+            center_time=center_s,
+            window_length=window_s,
+            window_type=self.right_panel.window_type_combo.currentText(),
+            output_mode=self.right_panel.output_mode_combo.currentText(),
+            normalization=self.right_panel.normalization_combo.currentText(),
+        )
+        self._filter_worker.finished.connect(self._on_narrowband_done)
+        self._filter_worker.error.connect(self._on_narrowband_error)
+        self._filter_worker.start()
+
+    def _on_narrowband_done(self, result: dict) -> None:
+        self._narrowband_result = result
         self._set_step(2)
-        self._refresh_time_plot()
-        self.statusBar().showMessage(f"{ready_message}，可查看频谱、计算特征或导出 CSV")
+
+        time_unit = self.right_panel.time_unit_combo.currentText()
+        freq_unit = self.right_panel.freq_display_unit.currentText()
+        peak_t = format_time(result["peak_time"], time_unit)
+        lowcut_str = format_frequency(result["lowcut"], freq_unit)
+        highcut_str = format_frequency(result["highcut"], freq_unit)
+
+        # Slice envelope to match packet time range
+        envelope = result["envelope_full"] if self.right_panel.show_envelope_check.isChecked() else None
+        if envelope is not None and envelope.size != result["time"].size:
+            mask = (self.signal.time >= result["time"][0]) & (self.signal.time <= result["time"][-1])
+            envelope = envelope[mask]
+
+        self.display.plot_narrowband_result(
+            result["time"], result["signal"],
+            envelope=envelope,
+            original_time=self.signal.time,
+            original_signal=next(iter(self._visible_data().values())) if self.right_panel.show_original_check.isChecked() else None,
+            filtered_full=result["filtered_full"] if self.right_panel.show_filtered_full_check.isChecked() else None,
+            show_envelope=self.right_panel.show_envelope_check.isChecked(),
+            show_original=self.right_panel.show_original_check.isChecked(),
+            show_filtered_full=self.right_panel.show_filtered_full_check.isChecked(),
+            time_unit=time_unit,
+            grid=self.right_panel.grid_check.isChecked(),
+        )
+
+        self.right_panel.set_ready("窄带波包提取完成")
+        self._update_status(
+            state="窄带波包提取完成",
+            view="时域信号",
+        )
+        self.statusBar().showMessage(
+            f"窄带波包提取完成 | 峰值时间 = {peak_t} | 频带 = {lowcut_str}–{highcut_str}"
+        )
+
+    def _on_narrowband_error(self, msg: str) -> None:
+        self.right_panel.set_ready("提取失败")
+        self._show_error("窄带波包提取失败", msg)
+
+    # ── Spectrum ──
 
     def _run_fft(self) -> None:
         if not self._require_signal():
@@ -317,38 +475,51 @@ class MainWindow(QMainWindow):
         try:
             spectra = {}
             for name, values in self._visible_data().items():
-                freqs, amplitudes = compute_fft(values, self.control_panel.sample_rate_input.value())
-                dominant = float(freqs[int(np.argmax(amplitudes[1:]) + 1)]) if freqs.size > 1 else 0.0
-                spectra[name] = (freqs, amplitudes, dominant)
+                freqs, amplitudes = compute_fft(values, self.signal.sample_rate)
+                dom = find_dominant_frequency(values, self.signal.sample_rate, exclude_dc=True)
+                spectra[name] = (freqs, amplitudes, float(dom["dominant_hz"]))
             self.display.plot_spectrum_multi(
-                spectra,
-                self.channel_panel.channel_colors(),
-                grid=self.control_panel.grid_check.isChecked(),
+                spectra, self.left_panel.channel_colors(),
+                grid=self.right_panel.grid_check.isChecked(),
+                ignore_dc=self.right_panel.ignore_dc_check.isChecked(),
+                db_scale=self.right_panel.db_scale_check.isChecked(),
+                freq_unit=self.right_panel.freq_display_unit.currentText(),
             )
         except Exception as exc:
             self._show_error("频谱分析失败", _friendly_error(exc))
             return
         self._set_step(2)
-        self.statusBar().showMessage("频谱已生成，虚线标注各通道主频")
+        self._update_status(state="频谱已生成", view="频域信号")
+
+    # ── Features ──
 
     def _run_features(self) -> None:
         if not self._require_signal():
             return
-        try:
-            rows = []
-            for name, values in self._visible_data().items():
-                features = compute_basic_features(
-                    self.signal.time, values, self.control_panel.sample_rate_input.value()
-                )
-                rows.append({"channel": name, **features})
-            self.feature_rows = rows
-            self._fill_feature_table(rows)
-        except Exception as exc:
-            self._show_error("特征计算失败", _friendly_error(exc))
+        visible = self._visible_data()
+        if not visible:
+            self._show_error("缺少数据", "请先勾选至少一个通道。")
             return
-        self._set_step(3)
+
+        self.right_panel.set_busy(True, "正在计算特征参数...")
+        self._feature_worker = FeatureWorker(self.signal.time, visible, self.signal.sample_rate)
+        self._feature_worker.finished.connect(self._on_features_done)
+        self._feature_worker.error.connect(self._on_features_error)
+        self._feature_worker.start()
+
+    def _on_features_done(self, rows: list[dict]) -> None:
+        self.feature_rows = rows
+        self.display.feature_widget.set_features(rows)
         self.display.show_features()
-        self.statusBar().showMessage("特征参数已更新，包含 Hilbert 包络 TOF 和能量特征")
+        self._set_step(3)
+        self.right_panel.set_ready("特征计算完成")
+        self._update_status(state="特征计算完成", view="特征参数")
+
+    def _on_features_error(self, msg: str) -> None:
+        self.right_panel.set_ready("特征计算失败")
+        self._show_error("特征计算失败", msg)
+
+    # ── Wavelet ──
 
     def _run_wavelet(self) -> None:
         if not self._require_signal():
@@ -357,43 +528,92 @@ class MainWindow(QMainWindow):
         if not visible:
             self._show_error("小波变换失败", "请先勾选至少一个通道。")
             return
-        try:
-            self._validate_wavelet()
-            self.control_panel.set_busy(True, "正在生成小波时频图...")
-            QApplication.processEvents()
-            name, values = next(iter(visible.items()))
-            freqs, coefficients = compute_cwt(
-                values,
-                self.control_panel.sample_rate_input.value(),
-                self.control_panel.cwt_min_input.value(),
-                self.control_panel.cwt_max_input.value(),
-                self.control_panel.cwt_points_input.value(),
-                self.control_panel.wavelet_combo.currentText(),
-            )
-            self.display.plot_wavelet(coefficients, self.signal.time, freqs)
-        except Exception as exc:
-            self.control_panel.set_ready("小波图生成失败")
-            self._show_error("小波图生成失败", _friendly_error(exc))
-            return
-        message = f"小波图已生成：{name}"
-        if self.last_auto_adjustment:
-            message = f"{message}；{self.last_auto_adjustment}"
-        self.control_panel.set_ready(message)
+
+        name, values = next(iter(visible.items()))
+        f_min = self.right_panel.cwt_f_min_hz()
+        f_max = self.right_panel.cwt_f_max_hz()
+        n_freqs = self.right_panel.cwt_points_input.value()
+        max_pts = self.right_panel.cwt_max_points_input.value()
+
+        # Prepare signal for CWT
+        time_range = None
+        if self.right_panel.cwt_time_mode.currentText() == "自动定位主波包":
+            if self._narrowband_result is not None:
+                t0 = self._narrowband_result["peak_time"]
+                half = self._narrowband_result["params"]["window_length"] * 2.0
+                time_range = (t0 - half, t0 + half)
+
+        prep = prepare_signal_for_cwt(
+            self.signal.time, values, self.signal.sample_rate,
+            time_range=time_range,
+            max_points=max_pts if self.right_panel.cwt_auto_decimate.isChecked() else 999999999,
+        )
+        cost = estimate_cwt_cost(prep["signal"].size, n_freqs)
+        self.right_panel.update_cwt_cost_info(
+            original=values.size,
+            input_pts=prep["signal"].size,
+            decimation=prep["decimation_factor"],
+            cost=cost,
+        )
+
+        self.right_panel.set_busy(True, "正在进行小波变换...")
+        self._update_status(state="正在进行小波变换...")
+
+        self._cwt_worker = CWTWorker(
+            prep["signal"], prep["fs"], f_min, f_max, n_freqs,
+            wavelet=self.right_panel.wavelet_combo.currentText(),
+        )
+        self._cwt_worker.progress.connect(
+            lambda p: self._update_status(state=f"小波变换 {p}%")
+        )
+        self._cwt_worker.finished.connect(
+            lambda r: self._on_wavelet_done(r, prep["time"])
+        )
+        self._cwt_worker.error.connect(self._on_wavelet_error)
+        self._cwt_worker.start()
+
+    def _cancel_wavelet(self) -> None:
+        if self._cwt_worker is not None and self._cwt_worker.isRunning():
+            self._cwt_worker.cancel()
+            self.right_panel.set_ready("小波计算已取消")
+            self._update_status(state="小波计算已取消")
+
+    def _on_wavelet_done(self, result: dict, cwt_time: np.ndarray) -> None:
+        freq_unit = self.right_panel.freq_display_unit.currentText()
+        time_unit = self.right_panel.time_unit_combo.currentText()
+        self.display.plot_wavelet(
+            result["coefficients"], cwt_time, result["frequencies"],
+            freq_unit=freq_unit,
+            time_unit=time_unit,
+            colormap=self.right_panel.cwt_colormap.currentText(),
+        )
         self._set_step(3)
-        self.statusBar().showMessage(message)
+        self.right_panel.set_ready("小波图已生成")
+        self._update_status(state="小波变换完成", view="小波变换")
+
+    def _on_wavelet_error(self, msg: str) -> None:
+        self.right_panel.set_ready("小波变换失败")
+        self._update_status(state="小波变换失败")
+        if "已取消" not in msg:
+            self._show_error("小波变换失败", msg)
+
+    # ── AI ──
 
     def _run_ai_adjustment(self) -> None:
         if not self._require_signal():
             return
-        assert self.signal is not None
-        config = self.control_panel.ai_config()
+        config = self.right_panel.ai_config()
         try:
             if config.enabled:
                 if not config.api_key:
-                    raise ValueError("请填写 API Key，或关闭“启用大模型 API”使用本地自动建议。")
-                suggestion = suggest_analysis_parameters(
-                    self.signal.time, self.signal.channels, self.signal.sample_rate, config
-                )
+                    raise ValueError("请填写 API Key，或关闭「启用大模型 API」使用本地自动建议。")
+                try:
+                    suggestion = suggest_analysis_parameters(
+                        self.signal.time, self.signal.channels, self.signal.sample_rate, config,
+                    )
+                except Exception as exc:
+                    suggestion = self._local_parameter_suggestion()
+                    suggestion["reason"] = f"在线 API 无法连接，已使用本地自动建议。{_friendly_error(exc)}"
             else:
                 suggestion = self._local_parameter_suggestion()
             message = self._apply_parameter_suggestion(suggestion)
@@ -401,38 +621,95 @@ class MainWindow(QMainWindow):
             self._show_error("智能识别参数失败", _friendly_error(exc))
             return
         QMessageBox.information(self, "智能识别参数", message)
-        self.control_panel.set_ready(message)
-        self.statusBar().showMessage(message)
+        self.right_panel.set_ready(message)
+        self._update_status(state="参数已调整")
 
-    def _export_signal_csv(self) -> None:
-        if not self._require_signal():
+    # ── Export ──
+
+    def _export_narrowband_csv(self) -> None:
+        result = self._narrowband_result
+        if result is None:
+            self._show_error("导出失败", "请先执行窄带波包提取。")
             return
-        path, _ = QFileDialog.getSaveFileName(self, "导出 CSV", "", "CSV (*.csv)")
+        path, _ = QFileDialog.getSaveFileName(self, "导出窄带波包 CSV", "", "CSV (*.csv)")
         if not path:
             return
         try:
-            signal = self.processed_signal or self.signal
-            export_signal_csv(signal, path, self.channel_panel.visible_channels())
+            export_signal_csv(
+                MultiChannelSignal(
+                    name="narrowband",
+                    time=result["time"],
+                    channels={"wave_packet": result["signal"]},
+                    sample_rate=self.signal.sample_rate,
+                ),
+                path,
+                ["wave_packet"],
+            )
+            self._set_step(4)
+            self._update_status(state="导出完成", view="结果导出")
         except Exception as exc:
             self._show_error("导出失败", _friendly_error(exc))
+
+    def _export_filtered_csv(self) -> None:
+        result = self._narrowband_result
+        if result is None:
+            self._show_error("导出失败", "请先执行窄带波包提取。")
             return
-        self._set_step(4)
-        self.statusBar().showMessage(f"导出成功：{path}")
+        path, _ = QFileDialog.getSaveFileName(self, "导出滤波后信号 CSV", "", "CSV (*.csv)")
+        if not path:
+            return
+        try:
+            export_signal_csv(
+                MultiChannelSignal(
+                    name="filtered_full",
+                    time=self.signal.time,
+                    channels={"filtered": result["filtered_full"]},
+                    sample_rate=self.signal.sample_rate,
+                ),
+                path,
+                ["filtered"],
+            )
+            self._update_status(state="导出完成", view="结果导出")
+        except Exception as exc:
+            self._show_error("导出失败", _friendly_error(exc))
+
+    def _export_envelope_csv(self) -> None:
+        result = self._narrowband_result
+        if result is None:
+            self._show_error("导出失败", "请先执行窄带波包提取。")
+            return
+        path, _ = QFileDialog.getSaveFileName(self, "导出 Hilbert 包络 CSV", "", "CSV (*.csv)")
+        if not path:
+            return
+        try:
+            export_signal_csv(
+                MultiChannelSignal(
+                    name="envelope",
+                    time=self.signal.time,
+                    channels={"envelope": result["envelope_full"]},
+                    sample_rate=self.signal.sample_rate,
+                ),
+                path,
+                ["envelope"],
+            )
+            self._update_status(state="导出完成", view="结果导出")
+        except Exception as exc:
+            self._show_error("导出失败", _friendly_error(exc))
 
     def _export_features_csv(self) -> None:
-        if not self.feature_rows:
+        if not self.display.feature_widget.has_data():
             self._show_error("导出失败", "请先计算特征参数。")
             return
         path, _ = QFileDialog.getSaveFileName(self, "导出特征表 CSV", "", "CSV (*.csv)")
         if not path:
             return
-        fieldnames = list(self.feature_rows[0].keys())
-        with Path(path).open("w", newline="", encoding="utf-8-sig") as handle:
-            writer = csv.DictWriter(handle, fieldnames=fieldnames)
-            writer.writeheader()
-            writer.writerows(self.feature_rows)
+        try:
+            self.display.feature_widget.export_csv(path)
+        except Exception as exc:
+            self._show_error("导出失败", _friendly_error(exc))
+            return
         self._set_step(4)
-        self.statusBar().showMessage(f"特征表已导出：{path}")
+        self._update_status(state="导出完成", view="结果导出")
 
     def _export_current_image(self) -> None:
         path, _ = QFileDialog.getSaveFileName(
@@ -446,85 +723,55 @@ class MainWindow(QMainWindow):
             self._show_error("导出图像失败", _friendly_error(exc))
             return
         self._set_step(4)
-        self.statusBar().showMessage(f"图像导出成功：{path}")
+        self._update_status(state="导出完成", view="结果导出")
 
-    def _local_parameter_suggestion(self) -> dict[str, float | int | str]:
-        assert self.signal is not None
-        dominant_values = []
-        for values in self.signal.channels.values():
-            freqs, amplitudes = compute_fft(values, self.signal.sample_rate)
-            if freqs.size > 1:
-                dominant_values.append(float(freqs[int(np.argmax(amplitudes[1:]) + 1)]))
-        nyquist = self.signal.sample_rate / 2.0
-        center = float(np.median(dominant_values)) if dominant_values else nyquist * 0.2
-        center = min(max(center, nyquist * 0.02), nyquist * 0.8)
-        bandwidth = min(max(center * 0.5, nyquist * 0.05), nyquist * 0.5)
-        return {
-            "center_frequency_hz": center,
-            "bandwidth_hz": bandwidth,
-            "filter_cycles": self.control_panel.filter_cycles_input.value(),
-            "wavelet": "morl",
-            "cwt_min_hz": max(center - bandwidth, nyquist * 0.01),
-            "cwt_max_hz": min(center + bandwidth * 2.0, nyquist * 0.95),
-            "cwt_points": self.control_panel.cwt_points_input.value(),
-            "reason": "根据当前信号主频自动估计。",
-        }
-
-    def _apply_parameter_suggestion(self, suggestion: dict) -> str:
-        assert self.signal is not None
-        nyquist = self.signal.sample_rate / 2.0
-        center = _coerce_float(suggestion.get("center_frequency_hz"), self.control_panel.center_input.value())
-        bandwidth = _coerce_float(suggestion.get("bandwidth_hz"), self.control_panel.bandwidth_input.value())
-        cycles = int(_coerce_float(suggestion.get("filter_cycles"), self.control_panel.filter_cycles_input.value()))
-        center = min(max(center, nyquist * 0.02), nyquist * 0.9)
-        bandwidth = min(max(bandwidth, nyquist * 0.01), nyquist * 0.8)
-        self.control_panel.center_input.setValue(center)
-        self.control_panel.bandwidth_input.setValue(bandwidth)
-        self.control_panel.filter_cycles_input.setValue(min(max(cycles, 1), 20))
-        self._validate_filter()
-
-        wavelet = str(suggestion.get("wavelet") or self.control_panel.wavelet_combo.currentText())
-        index = self.control_panel.wavelet_combo.findText(wavelet)
-        if index >= 0:
-            self.control_panel.wavelet_combo.setCurrentIndex(index)
-
-        cwt_min = _coerce_float(suggestion.get("cwt_min_hz"), self.control_panel.cwt_min_input.value())
-        cwt_max = _coerce_float(suggestion.get("cwt_max_hz"), self.control_panel.cwt_max_input.value())
-        self.control_panel.cwt_min_input.setValue(max(cwt_min, 1e-9))
-        self.control_panel.cwt_max_input.setValue(max(cwt_max, 1e-9))
-        self._validate_wavelet()
-        cwt_points = int(_coerce_float(suggestion.get("cwt_points"), self.control_panel.cwt_points_input.value()))
-        self.control_panel.cwt_points_input.setValue(min(max(cwt_points, 8), 512))
-
-        reason = str(suggestion.get("reason") or "已根据当前信号自动调整。")
-        return (
-            f"参数已调整：中心频率 {self.control_panel.center_input.value():.6g} Hz，"
-            f"带宽 {self.control_panel.bandwidth_input.value():.6g} Hz。{reason}"
-        )
+    # ── Helpers ──
 
     def _visible_data(self) -> dict[str, np.ndarray]:
         source = self.processed_signal or self.signal
         if source is None:
             return {}
-        visible = self.channel_panel.visible_channels()
+        visible = self.left_panel.visible_channels()
         return {name: source.channels[name] for name in visible if name in source.channels}
 
     def _display_time(self) -> tuple[np.ndarray, str]:
         assert self.signal is not None
-        unit = self.control_panel.time_unit_combo.currentText()
+        unit = self.right_panel.time_unit_combo.currentText()
         scale = {"s": 1.0, "ms": 1e3, "us": 1e6}[unit]
         return self.signal.time * scale, unit
 
+    def _require_signal(self) -> bool:
+        if self.signal is not None:
+            return True
+        self._show_error("缺少数据", "请先导入 CSV/TXT 或其他信号文件。")
+        return False
+
+    def _set_step(self, active_index: int) -> None:
+        for i, label in enumerate(self.step_labels):
+            label.setProperty("active", i <= active_index)
+            label.style().unpolish(label)
+            label.style().polish(label)
+
+    def _show_error(self, title: str, message: str) -> None:
+        QMessageBox.warning(self, title, message)
+        self._update_status(state="错误")
+
+    # ── Validation ──
+
     def _validate_filter(self) -> None:
-        fs = self.control_panel.sample_rate_input.value()
-        lowcut, highcut = self.control_panel.center_band()
+        fs = self.signal.sample_rate
+        lowcut, highcut = self.right_panel.center_band()
         nyquist = fs / 2.0
         self.last_auto_adjustment = ""
         if lowcut <= 0 or highcut >= nyquist:
             lowcut, highcut = self._auto_adjust_filter_band(fs)
-            self.last_auto_adjustment = f"已自动调整滤波范围到 {lowcut:.6g} Hz - {highcut:.6g} Hz"
-        self.control_panel.lowcut_input.setValue(lowcut)
-        self.control_panel.highcut_input.setValue(highcut)
+            self.last_auto_adjustment = f"已自动调整滤波范围到 {lowcut:.6g} Hz – {highcut:.6g} Hz"
+        self.right_panel.lowcut_input.setValue(
+            hz_to_frequency(lowcut, self.right_panel.lowcut_unit.currentText())
+        )
+        self.right_panel.highcut_input.setValue(
+            hz_to_frequency(highcut, self.right_panel.highcut_unit.currentText())
+        )
 
     def _auto_tune_filter_defaults(self) -> None:
         if self.signal is None:
@@ -540,7 +787,8 @@ class MainWindow(QMainWindow):
         nyquist = fs / 2.0
         margin = max(nyquist * 0.02, 1e-9)
         max_bandwidth = max(nyquist - 2.0 * margin, margin)
-        bandwidth = min(self.control_panel.bandwidth_input.value(), max_bandwidth)
+        bw_hz = self.right_panel.bandwidth_hz()
+        bandwidth = min(bw_hz, max_bandwidth)
         bandwidth = max(bandwidth, min(max_bandwidth, nyquist * 0.1))
 
         min_center = bandwidth / 2.0 + margin
@@ -550,201 +798,104 @@ class MainWindow(QMainWindow):
             min_center = bandwidth / 2.0 + margin
             max_center = nyquist - bandwidth / 2.0 - margin
 
-        center = min(max(self.control_panel.center_input.value(), min_center), max_center)
-        self.control_panel.center_input.setValue(center)
-        self.control_panel.bandwidth_input.setValue(bandwidth)
+        center = min(max(self.right_panel.center_freq_hz(), min_center), max_center)
+        self.right_panel.set_center_freq_hz(center)
+        self.right_panel.set_bandwidth_hz(bandwidth)
         return center - bandwidth / 2.0, center + bandwidth / 2.0
 
     def _validate_wavelet(self) -> None:
-        fs = self.control_panel.sample_rate_input.value()
-        f_min = self.control_panel.cwt_min_input.value()
-        f_max = self.control_panel.cwt_max_input.value()
+        fs = self.signal.sample_rate
+        f_min = self.right_panel.cwt_f_min_hz()
+        f_max = self.right_panel.cwt_f_max_hz()
         nyquist = fs / 2.0
         self.last_auto_adjustment = ""
         if f_min <= 0 or f_max >= nyquist or f_min >= f_max:
             f_min, f_max = self._auto_adjust_wavelet_range(fs)
-            self.last_auto_adjustment = f"已自动调整小波频率范围到 {f_min:.6g} Hz - {f_max:.6g} Hz"
+            self.last_auto_adjustment = f"已自动调整小波频率范围到 {f_min:.6g} Hz – {f_max:.6g} Hz"
 
     def _auto_adjust_wavelet_range(self, fs: float) -> tuple[float, float]:
         nyquist = fs / 2.0
         max_freq = max(nyquist * 0.95, 1e-9)
-        min_freq = max(min(self.control_panel.cwt_min_input.value(), max_freq * 0.5), 1e-9)
-        current_max = self.control_panel.cwt_max_input.value()
+        min_freq = max(min(self.right_panel.cwt_f_min_hz(), max_freq * 0.5), 1e-9)
+        current_max = self.right_panel.cwt_f_max_hz()
         if current_max <= min_freq or current_max >= nyquist:
             current_max = max_freq
         if min_freq >= current_max:
             min_freq = max(current_max * 0.05, 1e-9)
-        self.control_panel.cwt_min_input.setValue(min_freq)
-        self.control_panel.cwt_max_input.setValue(current_max)
+        self.right_panel.cwt_min_input.setValue(
+            hz_to_frequency(min_freq, self.right_panel.cwt_min_unit.currentText())
+        )
+        self.right_panel.cwt_max_input.setValue(
+            hz_to_frequency(current_max, self.right_panel.cwt_max_unit.currentText())
+        )
         return min_freq, current_max
 
-    def _require_signal(self) -> bool:
-        if self.signal is not None:
-            return True
-        self._show_error("缺少数据", "请先导入 CSV/TXT 或其他信号文件。")
-        return False
+    # ── Local AI suggestions ──
 
-    def _fill_feature_table(self, rows: list[dict[str, float | str]]) -> None:
-        self.feature_table.setRowCount(len(rows))
-        keys = [
-            "channel",
-            "peak",
-            "peak_to_peak",
-            "rms",
-            "energy",
-            "average_power",
-            "envelope_energy",
-            "envelope_area",
-            "dominant_frequency",
-            "peak_time",
-            "tof",
-            "envelope_peak",
-        ]
-        for row_index, row in enumerate(rows):
-            for column_index, key in enumerate(keys):
-                value = row[key]
-                text = str(value) if isinstance(value, str) else f"{value:.8g}"
-                item = QTableWidgetItem(text)
-                item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
-                self.feature_table.setItem(row_index, column_index, item)
-        self.feature_table.resizeColumnsToContents()
+    def _local_parameter_suggestion(self) -> dict[str, float | int | str]:
+        assert self.signal is not None
+        doms = []
+        for values in self.signal.channels.values():
+            d = find_dominant_frequency(values, self.signal.sample_rate, exclude_dc=True)
+            if d["dominant_hz"] > 0:
+                doms.append(d["dominant_hz"])
+        nyquist = self.signal.sample_rate / 2.0
+        center = float(np.median(doms)) if doms else nyquist * 0.2
+        center = min(max(center, nyquist * 0.02), nyquist * 0.8)
+        bandwidth = min(max(center * 0.5, nyquist * 0.05), nyquist * 0.5)
+        return {
+            "center_frequency_hz": center,
+            "bandwidth_hz": bandwidth,
+            "filter_cycles": 3,
+            "wavelet": "cmor1.5-1.0",
+            "cwt_min_hz": max(center - bandwidth, nyquist * 0.01),
+            "cwt_max_hz": min(center + bandwidth * 2.0, nyquist * 0.95),
+            "cwt_points": self.right_panel.cwt_points_input.value(),
+            "reason": "根据当前信号主频自动估计。",
+        }
 
-    def _set_step(self, active_index: int) -> None:
-        for index, label in enumerate(self.step_labels):
-            label.setProperty("activeStep", index == active_index)
-            label.style().unpolish(label)
-            label.style().polish(label)
+    def _apply_parameter_suggestion(self, suggestion: dict) -> str:
+        assert self.signal is not None
+        nyquist = self.signal.sample_rate / 2.0
+        center = _coerce_float(suggestion.get("center_frequency_hz"), self.right_panel.center_freq_hz())
+        bandwidth = _coerce_float(suggestion.get("bandwidth_hz"), self.right_panel.bandwidth_hz())
+        center = min(max(center, nyquist * 0.02), nyquist * 0.9)
+        bandwidth = min(max(bandwidth, nyquist * 0.01), nyquist * 0.8)
+        self.right_panel.set_center_freq_hz(center)
+        self.right_panel.set_bandwidth_hz(bandwidth)
 
-    def _show_error(self, title: str, message: str) -> None:
-        QMessageBox.warning(self, title, message)
-        self.statusBar().showMessage(message)
+        wavelet = str(suggestion.get("wavelet") or self.right_panel.wavelet_combo.currentText())
+        idx = self.right_panel.wavelet_combo.findText(wavelet)
+        if idx >= 0:
+            self.right_panel.wavelet_combo.setCurrentIndex(idx)
 
-    def _apply_style(self) -> None:
-        self.setStyleSheet(
-            """
-            QMainWindow, QWidget {
-                font-family: "Microsoft YaHei", "Segoe UI", Arial, sans-serif;
-                font-size: 13px;
-                color: #111827;
-            }
-            QMainWindow, QWidget#centerPanel {
-                background: #F7F9FC;
-            }
-            QFrame#topBar, QWidget#sidePanel, QGroupBox, QTabWidget::pane {
-                background: #FFFFFF;
-                border: 1px solid #E5E7EB;
-                border-radius: 8px;
-            }
-            QFrame#topBar {
-                padding: 6px;
-            }
-            QLabel#appTitle {
-                font-size: 18px;
-                font-weight: 700;
-                color: #111827;
-            }
-            QLabel[activeStep="true"] {
-                color: #2563EB;
-                font-weight: 700;
-            }
-            QLabel[activeStep="false"], QLabel#stepArrow, QLabel#mutedLabel {
-                color: #6B7280;
-            }
-            QLabel#emptyState {
-                color: #6B7280;
-                font-size: 16px;
-                background: #FFFFFF;
-                border: 1px dashed #CBD5E1;
-                border-radius: 8px;
-                padding: 32px;
-            }
-            QGroupBox {
-                margin-top: 12px;
-                padding: 12px;
-                font-weight: 700;
-            }
-            QGroupBox::title {
-                subcontrol-origin: margin;
-                left: 10px;
-                padding: 0 4px;
-                color: #111827;
-            }
-            QPushButton {
-                border-radius: 7px;
-                padding: 8px 10px;
-                font-weight: 600;
-            }
-            QPushButton[variant="primary"] {
-                background: #2563EB;
-                color: white;
-                border: 1px solid #2563EB;
-            }
-            QPushButton[variant="primary"]:hover {
-                background: #1D4ED8;
-            }
-            QPushButton[variant="secondary"] {
-                background: #FFFFFF;
-                color: #2563EB;
-                border: 1px solid #BFDBFE;
-            }
-            QComboBox, QDoubleSpinBox, QSpinBox, QLineEdit {
-                background: #FFFFFF;
-                border: 1px solid #D1D5DB;
-                border-radius: 6px;
-                padding: 5px 7px;
-            }
-            QTableWidget {
-                background: #FFFFFF;
-                border: 1px solid #E5E7EB;
-                border-radius: 8px;
-                gridline-color: #E5E7EB;
-            }
-            QHeaderView::section {
-                background: #F3F4F6;
-                border: 0;
-                padding: 7px;
-                font-weight: 700;
-            }
-            QTabBar::tab {
-                background: #EEF2FF;
-                color: #374151;
-                padding: 8px 14px;
-                border-top-left-radius: 7px;
-                border-top-right-radius: 7px;
-                margin-right: 4px;
-            }
-            QTabBar::tab:selected {
-                background: #2563EB;
-                color: white;
-            }
-            QLabel#statusHint {
-                color: #047857;
-                background: #ECFDF5;
-                border: 1px solid #BBF7D0;
-                border-radius: 7px;
-                padding: 8px;
-            }
-            """
-        )
+        freq_unit = self.right_panel.freq_display_unit.currentText()
+        cwt_min = _coerce_float(suggestion.get("cwt_min_hz"), self.right_panel.cwt_f_min_hz())
+        cwt_max = _coerce_float(suggestion.get("cwt_max_hz"), self.right_panel.cwt_f_max_hz())
+        self.right_panel.cwt_min_input.setValue(hz_to_frequency(max(cwt_min, 1e-9), self.right_panel.cwt_min_unit.currentText()))
+        self.right_panel.cwt_max_input.setValue(hz_to_frequency(max(cwt_max, 1e-9), self.right_panel.cwt_max_unit.currentText()))
 
+        reason = str(suggestion.get("reason") or "已根据当前信号自动调整。")
+        return f"参数已调整：中心频率 {format_frequency(center, freq_unit)}，带宽 {format_frequency(bandwidth, freq_unit)}。{reason}"
+
+
+# ── Module-level helpers ──
 
 def _combine_signals_as_channels(paths: list[Path], signals: list[MultiChannelSignal]) -> MultiChannelSignal:
     if not signals:
         raise ValueError("No signals were loaded.")
     base_fs = signals[0].sample_rate
-    for signal in signals[1:]:
-        relative = abs(signal.sample_rate - base_fs) / base_fs
-        if relative > 1e-3:
+    for sig in signals[1:]:
+        if abs(sig.sample_rate - base_fs) / base_fs > 1e-3:
             raise ValueError("多文件采样率不一致，请分别导入或统一采样率后再合并。")
-
-    min_len = min(signal.time.size for signal in signals)
+    min_len = min(sig.time.size for sig in signals)
     channels: dict[str, np.ndarray] = {}
-    for path, signal in zip(paths, signals):
-        for channel_name, values in signal.channels.items():
+    for path, sig in zip(paths, signals):
+        for ch_name, vals in sig.channels.items():
             if len(channels) >= 8:
                 break
-            merged_name = f"{path.stem}:{channel_name}" if len(signals) > 1 else str(channel_name)
-            channels[merged_name] = values[:min_len]
+            merged = f"{path.stem}:{ch_name}" if len(signals) > 1 else str(ch_name)
+            channels[merged] = vals[:min_len]
         if len(channels) >= 8:
             break
     return MultiChannelSignal(
@@ -752,7 +903,7 @@ def _combine_signals_as_channels(paths: list[Path], signals: list[MultiChannelSi
         time=signals[0].time[:min_len],
         channels=channels,
         sample_rate=base_fs,
-        metadata={"source_files": [str(path) for path in paths], "truncated_samples": min_len},
+        metadata={"source_files": [str(p) for p in paths], "truncated_samples": min_len},
     )
 
 
@@ -761,6 +912,19 @@ def _coerce_float(value: object, default: float) -> float:
         return float(value)
     except (TypeError, ValueError):
         return default
+
+
+def _smooth_envelope(values: np.ndarray, sample_rate: float) -> np.ndarray:
+    env = hilbert_envelope(values)
+    win = max(int(sample_rate * 2e-6), 5)
+    win = min(win, max(env.size // 20, 5))
+    if win % 2 == 0:
+        win += 1
+    if win >= env.size:
+        return env
+    kernel = np.hanning(win)
+    kernel /= np.sum(kernel)
+    return np.convolve(env, kernel, mode="same")
 
 
 def _friendly_error(error: Exception | str) -> str:
