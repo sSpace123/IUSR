@@ -102,9 +102,9 @@ class CoreAlgorithmTests(unittest.TestCase):
         fs = 1000.0
         time = np.arange(128) / fs
         values = np.sin(2 * np.pi * 80.0 * time)
-        freqs, coefficients = compute_cwt(values, fs, 20.0, 200.0, 16)
-        self.assertEqual(freqs.shape, (16,))
-        self.assertEqual(coefficients.shape, (16, 128))
+        freqs, coefficients = compute_cwt(values, fs, 20.0, 200.0, 24)
+        self.assertEqual(freqs.shape, (24,))
+        self.assertEqual(coefficients.shape, (24, 128))
 
     def test_export_signal_csv(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

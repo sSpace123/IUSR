@@ -95,6 +95,65 @@ def estimate_delay_by_xcorr(
     return lag_samples / fs
 
 
+def compute_envelope_features(
+    time: np.ndarray | list[float],
+    signal: np.ndarray | list[float],
+    fs: float,
+) -> dict[str, float]:
+    """Extract envelope-based features from a signal.
+
+    Returns a dict with: envelope_peak, envelope_peak_time, envelope_rms,
+    envelope_energy, envelope_rise_time, envelope_fall_time, tof_10pct, tof_50pct.
+    Times are in seconds.
+    """
+    time_values = np.asarray(time, dtype=float)
+    values = np.asarray(signal, dtype=float)
+    envelope = _envelope(values)
+    peak_idx = int(np.argmax(envelope))
+    peak_val = float(envelope[peak_idx])
+    peak_time = float(time_values[peak_idx])
+
+    tof_10 = float(time_values[_estimate_tof_index(envelope, 0.1)])
+    tof_50 = float(time_values[_estimate_tof_index(envelope, 0.5)])
+
+    # Rise time: 10% → 90% of peak
+    rise_idx = _estimate_tof_index(envelope, 0.9)
+    rise_10_idx = _estimate_tof_index(envelope, 0.1)
+    rise_time = float(time_values[rise_idx] - time_values[rise_10_idx]) if rise_idx > rise_10_idx else 0.0
+
+    # Fall time: peak → 10% of peak (after peak)
+    fall_10_idx = peak_idx + int(np.argmax(envelope[peak_idx:] <= peak_val * 0.1)) if peak_idx < envelope.size - 1 else envelope.size - 1
+    fall_time = float(time_values[fall_10_idx] - time_values[peak_idx]) if fall_10_idx > peak_idx else 0.0
+
+    return {
+        "envelope_peak": peak_val,
+        "envelope_peak_time": peak_time,
+        "envelope_rms": float(np.sqrt(np.mean(envelope**2))),
+        "envelope_energy": float(np.sum(envelope**2)),
+        "envelope_rise_time": rise_time,
+        "envelope_fall_time": fall_time,
+        "tof_10pct": tof_10,
+        "tof_50pct": tof_50,
+    }
+
+
+def estimate_arrival_time(
+    time: np.ndarray | list[float],
+    signal: np.ndarray | list[float],
+    threshold_ratio: float = 0.1,
+) -> float:
+    """Estimate time-of-arrival from the first envelope threshold crossing (10% by default).
+
+    Returns time in seconds.
+    """
+    time_values = np.asarray(time, dtype=float)
+    envelope = hilbert_envelope(signal)
+    if time_values.size != envelope.size:
+        raise ValueError("时间序列和信号长度必须相同。")
+    idx = _estimate_tof_index(envelope, threshold_ratio)
+    return float(time_values[idx])
+
+
 def _envelope(values: np.ndarray) -> np.ndarray:
     try:
         from scipy.signal import hilbert

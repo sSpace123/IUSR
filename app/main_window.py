@@ -776,11 +776,21 @@ class MainWindow(QMainWindow):
     def _auto_tune_filter_defaults(self) -> None:
         if self.signal is None:
             return
+        suggestion = self._local_parameter_suggestion()
+        self.right_panel.set_center_freq_hz(float(suggestion["center_frequency_hz"]))
+        self.right_panel.set_bandwidth_hz(float(suggestion["bandwidth_hz"]))
         self._auto_adjust_filter_band(self.signal.sample_rate)
 
     def _auto_tune_wavelet_defaults(self) -> None:
         if self.signal is None:
             return
+        suggestion = self._local_parameter_suggestion()
+        self.right_panel.cwt_min_input.setValue(
+            hz_to_frequency(float(suggestion["cwt_min_hz"]), self.right_panel.cwt_min_unit.currentText())
+        )
+        self.right_panel.cwt_max_input.setValue(
+            hz_to_frequency(float(suggestion["cwt_max_hz"]), self.right_panel.cwt_max_unit.currentText())
+        )
         self._auto_adjust_wavelet_range(self.signal.sample_rate)
 
     def _auto_adjust_filter_band(self, fs: float) -> tuple[float, float]:
@@ -835,20 +845,32 @@ class MainWindow(QMainWindow):
     def _local_parameter_suggestion(self) -> dict[str, float | int | str]:
         assert self.signal is not None
         doms = []
+        nyquist = self.signal.sample_rate / 2.0
+        min_freq = _ultrasonic_frequency_floor(self.signal.sample_rate, len(self.signal.time))
+        max_freq = nyquist * 0.95
         for values in self.signal.channels.values():
-            d = find_dominant_frequency(values, self.signal.sample_rate, exclude_dc=True)
+            d = find_dominant_frequency(
+                values,
+                self.signal.sample_rate,
+                exclude_dc=True,
+                min_frequency=min_freq,
+                max_frequency=max_freq,
+            )
             if d["dominant_hz"] > 0:
                 doms.append(d["dominant_hz"])
-        nyquist = self.signal.sample_rate / 2.0
         center = float(np.median(doms)) if doms else nyquist * 0.2
-        center = min(max(center, nyquist * 0.02), nyquist * 0.8)
-        bandwidth = min(max(center * 0.5, nyquist * 0.05), nyquist * 0.5)
+        center = min(max(center, min_freq), nyquist * 0.85)
+        bandwidth = min(max(center * 0.45, nyquist * 0.005), nyquist * 0.35)
+        if center - bandwidth / 2.0 <= 0:
+            bandwidth = center * 1.5
+        if center + bandwidth / 2.0 >= nyquist:
+            bandwidth = max((nyquist - center) * 1.6, nyquist * 0.01)
         return {
             "center_frequency_hz": center,
             "bandwidth_hz": bandwidth,
             "filter_cycles": 3,
             "wavelet": "cmor1.5-1.0",
-            "cwt_min_hz": max(center - bandwidth, nyquist * 0.01),
+            "cwt_min_hz": max(center - bandwidth, min_freq),
             "cwt_max_hz": min(center + bandwidth * 2.0, nyquist * 0.95),
             "cwt_points": self.right_panel.cwt_points_input.value(),
             "reason": "根据当前信号主频自动估计。",
@@ -912,6 +934,13 @@ def _coerce_float(value: object, default: float) -> float:
         return float(value)
     except (TypeError, ValueError):
         return default
+
+
+def _ultrasonic_frequency_floor(sample_rate: float, sample_count: int) -> float:
+    """Ignore drift and very-low-frequency baseline when auto-picking carrier."""
+    nyquist = sample_rate / 2.0
+    bin_width = sample_rate / max(sample_count, 1)
+    return min(max(nyquist * 0.01, bin_width * 5.0, 1.0), nyquist * 0.5)
 
 
 def _smooth_envelope(values: np.ndarray, sample_rate: float) -> np.ndarray:

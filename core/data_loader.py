@@ -157,21 +157,30 @@ def _sniff_delimiter(path: Path) -> str | None:
 
 
 def _detect_table_layout(path: Path, delimiter: str | None) -> dict:
-    sample_lines = _read_sample_lines(path, 300)
+    entries = _read_sample_lines(path, 300)
     selected_delimiter = delimiter if delimiter is not None else _sniff_delimiter(path)
     metadata: dict[str, str] = {}
     data_row_index = 0
     header_row_index: int | None = None
+    data_file_line = 0
 
-    for index, line in enumerate(sample_lines):
+    for idx, (line, file_line) in enumerate(entries):
         parts = _split_line(line, selected_delimiter)
-        if len(parts) >= 2 and _numeric_cell_count(parts) >= 2:
-            data_row_index = index
-            previous_index = _previous_non_empty_line(sample_lines, index)
-            if previous_index is not None:
-                previous_parts = _split_line(sample_lines[previous_index], selected_delimiter)
-                if len(previous_parts) == len(parts) and _numeric_cell_count(previous_parts) == 0:
-                    header_row_index = previous_index
+        numeric_cells = _numeric_cell_count(parts)
+        is_data_row = (
+            len(parts) >= 2
+            and numeric_cells >= max(2, len(parts) // 2)
+            and _is_number(parts[0])
+        )
+        if is_data_row:
+            data_row_index = idx
+            data_file_line = file_line
+            prev_entry = _previous_non_empty_entry(entries, idx)
+            if prev_entry is not None:
+                prev_line, prev_file_line = prev_entry
+                prev_parts = _split_line(prev_line, selected_delimiter)
+                if len(prev_parts) == len(parts) and _numeric_cell_count(prev_parts) == 0:
+                    header_row_index = prev_file_line
             break
         if len(parts) >= 2 and parts[0]:
             metadata[parts[0]] = ",".join(parts[1:]).strip()
@@ -180,7 +189,7 @@ def _detect_table_layout(path: Path, delimiter: str | None) -> dict:
 
     return {
         "delimiter": selected_delimiter,
-        "skip_rows": header_row_index if header_row_index is not None else data_row_index,
+        "skip_rows": header_row_index if header_row_index is not None else data_file_line,
         "has_header": header_row_index is not None,
         "metadata": metadata,
     }
@@ -207,18 +216,19 @@ def _read_preview_frame(
     return frame
 
 
-def _read_sample_lines(path: Path, limit: int) -> list[str]:
-    lines: list[str] = []
+def _read_sample_lines(path: Path, limit: int) -> list[tuple[str, int]]:
+    """Return (stripped_line, file_line_number) for non-empty lines."""
+    entries: list[tuple[str, int]] = []
     with path.open("r", encoding="utf-8-sig", errors="ignore") as handle:
-        for _ in range(limit):
+        for line_num in range(limit):
             line = handle.readline()
             if line == "":
                 break
             if line.strip():
-                lines.append(line.strip())
-    if not lines:
+                entries.append((line.strip(), line_num))
+    if not entries:
         raise ValueError("file is empty.")
-    return lines
+    return entries
 
 
 def _split_line(line: str, delimiter: str | None) -> list[str]:
@@ -235,10 +245,11 @@ def _numeric_cell_count(parts: list[str]) -> int:
     return sum(1 for part in parts if _is_number(part))
 
 
-def _previous_non_empty_line(lines: list[str], index: int) -> int | None:
+def _previous_non_empty_entry(entries: list[tuple[str, int]], index: int) -> tuple[str, int] | None:
     for previous in range(index - 1, -1, -1):
-        if lines[previous].strip():
-            return previous
+        line, _ = entries[previous]
+        if line.strip():
+            return entries[previous]
     return None
 
 
@@ -304,7 +315,7 @@ def _frame_to_signal(
     value_columns: list[str | int] | None = None,
 ) -> MultiChannelSignal:
     numeric = frame.apply(pd.to_numeric, errors="coerce").dropna(axis=1, how="all")
-    numeric = numeric.dropna(axis=0, how="any")
+    numeric = numeric.replace([np.inf, -np.inf], np.nan)
     if numeric.empty:
         raise ValueError("No numeric signal columns were found.")
 
@@ -312,6 +323,7 @@ def _frame_to_signal(
     if time_column is None:
         time_column = _detect_time_column(numeric)
     if time_column is not None:
+        numeric = numeric[np.isfinite(numeric[time_column].to_numpy(dtype=float))]
         time = numeric[time_column].to_numpy(dtype=float)
         available_channels = numeric.drop(columns=[time_column])
         inferred_sample_rate = infer_sample_rate_from_time(time)
@@ -332,17 +344,44 @@ def _frame_to_signal(
     if channels_frame.empty:
         raise ValueError("No channel columns were found.")
 
-    channels = {
-        str(column): channels_frame[column].to_numpy(dtype=float)
-        for column in channels_frame.columns[:8]
-    }
+    channels: dict[str, np.ndarray] = {}
+    invalid_counts: dict[str, int] = {}
+    for column in channels_frame.columns[:8]:
+        values, invalid_count = _repair_channel_values(channels_frame[column])
+        channels[str(column)] = values
+        if invalid_count:
+            invalid_counts[str(column)] = invalid_count
+
     return MultiChannelSignal(
         name=name,
         time=time,
         channels=channels,
         sample_rate=inferred_sample_rate,
-        metadata={"channel_count": len(channels), "time_column": time_column},
+        metadata={
+            "channel_count": len(channels),
+            "time_column": time_column,
+            "repaired_nonfinite_points": invalid_counts,
+        },
     )
+
+
+def _repair_channel_values(series: pd.Series) -> tuple[np.ndarray, int]:
+    """Return a finite channel vector, linearly filling isolated bad samples."""
+    values = series.to_numpy(dtype=float)
+    finite = np.isfinite(values)
+    invalid_count = int(values.size - np.count_nonzero(finite))
+    if invalid_count == 0:
+        return values, 0
+    if not np.any(finite):
+        raise ValueError(f"Channel {series.name} contains no finite numeric samples.")
+    if np.count_nonzero(finite) == 1:
+        values = np.full_like(values, float(values[finite][0]))
+        return values, invalid_count
+
+    repaired = values.copy()
+    x = np.arange(values.size, dtype=float)
+    repaired[~finite] = np.interp(x[~finite], x[finite], values[finite])
+    return repaired, invalid_count
 
 
 def _detect_time_column(frame: pd.DataFrame) -> str | int | None:

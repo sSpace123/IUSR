@@ -1,7 +1,13 @@
 .venv/
 .venv-anaconda/
+.venv-build/
 .uv-cache/
+.pytest_cache/
+.claude/
 __pycache__/
 *.py[cod]
 .env
 ui_preview.png
+build/
+dist/
+qa_outputs/

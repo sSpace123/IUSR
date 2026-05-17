@@ -8,7 +8,7 @@ from PySide6.QtWidgets import QLabel, QPushButton
 def make_step_label(text: str, active: bool = False) -> QLabel:
     """Create one label in the top workflow guide."""
     label = QLabel(text)
-    label.setProperty("activeStep", active)
+    label.setProperty("active", active)
     return label
 
 
